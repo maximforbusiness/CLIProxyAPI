@@ -108,6 +108,7 @@ func (a *CodexAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	callbackCh := make(chan *codex.OAuthResult, 1)
 	callbackErrCh := make(chan error, 1)
 	manualDescription := ""
+	resultSource := "listener"
 
 	go func() {
 		result, errWait := oauthServer.WaitForCallback(5 * time.Minute)
@@ -168,6 +169,7 @@ waitForCallback:
 				continue
 			}
 			manualDescription = parsed.ErrorDescription
+			resultSource = "manual"
 			result = &codex.OAuthResult{
 				Code:  parsed.Code,
 				State: parsed.State,
@@ -179,20 +181,54 @@ waitForCallback:
 		}
 	}
 
+	resultStatePreview := strings.TrimSpace(result.State)
+	if len(resultStatePreview) > 12 {
+		resultStatePreview = resultStatePreview[:12] + "..."
+	}
+	expectedStatePreview := strings.TrimSpace(state)
+	if len(expectedStatePreview) > 12 {
+		expectedStatePreview = expectedStatePreview[:12] + "..."
+	}
+	fmt.Printf("[codex-auth-debug] callback received via %s: code_present=%t code_len=%d state_present=%t state=%q error=%q\n",
+		resultSource,
+		result.Code != "",
+		len(result.Code),
+		result.State != "",
+		resultStatePreview,
+		result.Error,
+	)
+	fmt.Printf("[codex-auth-debug] expected state: len=%d value=%q\n", len(state), expectedStatePreview)
+
 	if result.Error != "" {
 		return nil, codex.NewOAuthError(result.Error, manualDescription, http.StatusBadRequest)
 	}
 
 	if result.State != state {
+		fmt.Println("[codex-auth-debug] callback state mismatch")
 		return nil, codex.NewAuthenticationError(codex.ErrInvalidState, fmt.Errorf("state mismatch"))
 	}
 
-	log.Debug("Codex authorization code received; exchanging for tokens")
+	fmt.Println("[codex-auth-debug] callback state matched")
+	fmt.Printf("[codex-auth-debug] starting token exchange redirect=%s\n", codex.RedirectURI)
 
 	authBundle, err := authSvc.ExchangeCodeForTokens(ctx, result.Code, pkceCodes)
 	if err != nil {
+		fmt.Printf("[codex-auth-debug] token exchange failed: %v\n", err)
 		return nil, codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, err)
 	}
+	fmt.Printf("[codex-auth-debug] token exchange completed: email=%q account_id_present=%t refresh_present=%t api_key_present=%t\n",
+		authBundle.TokenData.Email,
+		strings.TrimSpace(authBundle.TokenData.AccountID) != "",
+		strings.TrimSpace(authBundle.TokenData.RefreshToken) != "",
+		strings.TrimSpace(authBundle.APIKey) != "",
+	)
 
-	return a.buildAuthRecord(authSvc, authBundle)
+	fmt.Println("[codex-auth-debug] building auth record")
+	record, err := a.buildAuthRecord(authSvc, authBundle)
+	if err != nil {
+		fmt.Printf("[codex-auth-debug] build auth record failed: %v\n", err)
+		return nil, err
+	}
+	fmt.Printf("[codex-auth-debug] build auth record completed: id=%q file=%q\n", record.ID, record.FileName)
+	return record, nil
 }

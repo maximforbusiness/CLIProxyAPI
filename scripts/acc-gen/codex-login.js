@@ -1,0 +1,2050 @@
+const speakeasy = require('speakeasy');
+const proxyChain = require('proxy-chain');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const { execSync } = require('child_process');
+
+// Load accounts from accounts.json (or override via CODEX_ACCOUNTS_FILE)
+const ACCOUNTS_FILE = process.env.CODEX_ACCOUNTS_FILE
+    ? path.resolve(process.env.CODEX_ACCOUNTS_FILE)
+    : path.join(__dirname, 'accounts.json');
+let ACCOUNTS = [];
+
+if (fs.existsSync(ACCOUNTS_FILE)) {
+    ACCOUNTS = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    console.log(`Loaded ${ACCOUNTS.length} account(s) from ${ACCOUNTS_FILE}`);
+} else {
+    // Fallback to single account
+    ACCOUNTS = [{
+        email: 'edwards23322@belettersmail.com',
+        password: 'ALi562Djs1Hnf',
+        totpSecret: 'FXEFIAESL73TWLTJGDXSFS6YBGMDXM34',
+        name: 'Edward',
+        birthYear: 2000,
+        birthMonth: 1,
+        birthDay: 15
+    }];
+}
+
+// Current account index (can be passed via command line)
+const ACCOUNT_INDEX = parseInt(process.argv[3]) || 0;
+const ACCOUNT = ACCOUNTS[Math.min(ACCOUNT_INDEX, ACCOUNTS.length - 1)];
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+];
+const VIEWPORTS = [
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1536, height: 864 },
+    { width: 1600, height: 900 },
+    { width: 1920, height: 1080 }
+];
+
+const BROWSER_ENGINE = normalizeBrowserEngine(process.env.CODEX_BROWSER_ENGINE || 'auto');
+const HERO_SMS_BASE_URL = process.env.HERO_SMS_BASE_URL || 'https://hero-sms.com/stubs/handler_api.php';
+const HERO_SMS_SERVICE = (process.env.HERO_SMS_SERVICE || 'dr').trim();
+const HERO_SMS_SERVICES = String(process.env.HERO_SMS_SERVICES || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+const HERO_SMS_SERVICE_PREFIX = String(process.env.HERO_SMS_SERVICE_PREFIX || '').trim().toLowerCase();
+const HERO_SMS_SERVICE_QUERY = String(process.env.HERO_SMS_SERVICE_QUERY || 'open').trim().toLowerCase();
+const HERO_SMS_PRICE_RANKING = String(process.env.HERO_SMS_PRICE_RANKING || 'price_asc').trim().toLowerCase();
+const HERO_SMS_COUNTRIES = String(process.env.HERO_SMS_COUNTRIES || '52,16,6,4,7,13,2,1')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+const HERO_SMS_POLL_TIMEOUT_SEC = Math.max(30, parseInt(process.env.HERO_SMS_POLL_TIMEOUT_SEC || '180', 10) || 180);
+const HERO_SMS_POLL_INTERVAL_MS = Math.max(2000, parseInt(process.env.HERO_SMS_POLL_INTERVAL_MS || '3000', 10) || 3000);
+const HERO_SMS_API_KEY = String(process.env.HERO_SMS_API_KEY || '').trim();
+const PUPPETEER_CHROME_CANDIDATES = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_BIN,
+    process.env.CHROMIUM_BIN,
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium'
+].filter(Boolean);
+let heroSmsServiceCandidatesCache = null;
+const heroSmsPricesByCountryCache = new Map();
+
+function optionalRequire(modName) {
+    try {
+        return require(modName);
+    } catch (_) {
+        return null;
+    }
+}
+
+function normalizeBrowserEngine(raw) {
+    const v = String(raw || '').trim().toLowerCase();
+    if (!v || v === 'auto') return 'auto';
+    if (v === 'playright') return 'playwright';
+    if (v === 'playwright') return 'playwright';
+    if (v === 'puppeteer') return 'puppeteer';
+    return 'auto';
+}
+
+function browserEngineOrder(value) {
+    if (value === 'playwright') return ['playwright', 'puppeteer'];
+    if (value === 'puppeteer') return ['puppeteer', 'playwright'];
+    return ['puppeteer', 'playwright'];
+}
+
+function resolveChromeExecutable() {
+    for (const candidate of PUPPETEER_CHROME_CANDIDATES) {
+        if (candidate && fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+    return '';
+}
+
+function buildBrowserProfile() {
+    return {
+        userAgent: pickRandom(USER_AGENTS),
+        viewport: pickRandom(VIEWPORTS),
+        acceptLanguage: 'en-US,en;q=0.9'
+    };
+}
+
+function toTitleCase(word) {
+    const clean = String(word || '').toLowerCase();
+    if (!clean) return '';
+    return clean.charAt(0).toUpperCase() + clean.slice(1);
+}
+
+function buildValidFullName(rawName, email) {
+    const localPart = String(email || '').split('@')[0] || '';
+    const source = `${rawName || ''} ${localPart}`.trim();
+    const tokens = source
+        .replace(/[^a-zA-Z\s]/g, ' ')
+        .split(/\s+/)
+        .map((x) => x.trim())
+        .filter((x) => x.length >= 2)
+        .map(toTitleCase);
+
+    if (tokens.length >= 2) {
+        return `${tokens[0]} ${tokens[1]}`;
+    }
+    if (tokens.length === 1) {
+        return `${tokens[0]} Stone`;
+    }
+    return 'Alex Stone';
+}
+
+function pickRandom(list) {
+    return list[Math.floor(Math.random() * list.length)];
+}
+
+function getTOTPCode(secret) {
+    return speakeasy.totp({
+        secret: secret,
+        encoding: 'base32',
+        window: 1
+    });
+}
+
+function isCodexCallbackUrl(url) {
+    if (!url || !url.includes('localhost:1455')) {
+        return false;
+    }
+
+    try {
+        const parsed = new URL(url);
+        return parsed.hostname === 'localhost' &&
+               parsed.port === '1455' &&
+               parsed.pathname === '/auth/callback' &&
+               parsed.searchParams.has('code');
+    } catch (e) {
+        return false;
+    }
+}
+
+function stripTerminalArtifacts(value) {
+    const raw = String(value || '').replace(/\r/g, '').trim();
+    const match = raw.match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?[^ \t\r\n"'<>]+/i);
+    const candidate = match ? match[0] : raw;
+    return candidate
+        .replace(/(Waiting.*|Paste the Codex callback URL.*)$/i, '')
+        .trim();
+}
+
+function normalizeAuthUrl(rawUrl) {
+    const cleaned = stripTerminalArtifacts(rawUrl);
+    try {
+        const parsed = new URL(cleaned);
+        // The simplified flow flag started returning unstable route errors in some buckets.
+        if (parsed.searchParams.has('codex_cli_simplified_flow')) {
+            parsed.searchParams.delete('codex_cli_simplified_flow');
+        }
+        return parsed.toString();
+    } catch {
+        return cleaned;
+    }
+}
+
+function normalizeProxyScheme(raw) {
+    const value = String(raw || '').trim().toLowerCase();
+    if (!value) return 'http';
+    if (value === 'socs5') return 'socks5';
+    if (value === 'socks5h') return 'socks5';
+    if (['http', 'https', 'socks4', 'socks5'].includes(value)) return value;
+    return 'http';
+}
+
+function parseProxyEntry(entry, fallbackScheme = 'http') {
+    const raw = String(entry || '').trim();
+    if (!raw) return null;
+
+    let rest = raw;
+    let parsedScheme = null;
+    const schemeMatch = rest.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
+    if (schemeMatch) {
+        parsedScheme = normalizeProxyScheme(schemeMatch[1]);
+        rest = rest.slice(schemeMatch[0].length);
+    }
+
+    const scheme = parsedScheme || normalizeProxyScheme(fallbackScheme);
+    let hostPort = rest;
+    let username = '';
+    let password = '';
+
+    if (rest.includes('@')) {
+        const atIndex = rest.indexOf('@');
+        const left = rest.slice(0, atIndex);
+        const right = rest.slice(atIndex + 1);
+        const leftLooksHostPort = /^.+:\d+$/.test(left);
+        const rightLooksHostPort = /^.+:\d+$/.test(right);
+
+        if (leftLooksHostPort && !rightLooksHostPort) {
+            hostPort = left;
+            [username, password = ''] = right.split(':');
+        } else {
+            hostPort = right;
+            [username, password = ''] = left.split(':');
+        }
+    }
+
+    const hostPortMatch = hostPort.match(/^([^:]+):(\d+)$/);
+    if (!hostPortMatch) {
+        throw new Error(`Invalid proxy format: ${raw}`);
+    }
+
+    const host = hostPortMatch[1].trim();
+    const port = hostPortMatch[2].trim();
+    if (!host || !port) {
+        throw new Error(`Invalid proxy host/port in: ${raw}`);
+    }
+
+    return {
+        raw,
+        scheme,
+        server: `${scheme}://${host}:${port}`,
+        upstreamUrl: username ? `${scheme}://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}` : `${scheme}://${host}:${port}`,
+        username,
+        password
+    };
+}
+
+async function firstXPath(page, xpath) {
+    if (!page) return null;
+    if (typeof page.$x === 'function') {
+        const matches = await page.$x(xpath);
+        return matches[0] || null;
+    }
+
+    if (typeof page.locator === 'function') {
+        const baseLocator = page.locator(`xpath=${xpath}`);
+        const locator = (baseLocator && typeof baseLocator.first === 'function')
+            ? baseLocator.first()
+            : baseLocator;
+
+        if (!locator) return null;
+
+        if (typeof locator.count === 'function') {
+            const count = await locator.count().catch(() => 0);
+            if (!count) return null;
+        }
+
+        if (typeof locator.elementHandle === 'function') {
+            return locator.elementHandle().catch(() => null);
+        }
+
+        if (typeof locator.waitHandle === 'function') {
+            return locator.waitHandle({ timeout: 1000 }).catch(() => null);
+        }
+    }
+
+    return null;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function heroSmsErrorText(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return 'empty_response';
+    if (text.startsWith('{')) {
+        try {
+            const parsed = JSON.parse(text);
+            if (parsed.title && parsed.details) {
+                return `${parsed.title}:${parsed.details}`;
+            }
+            return JSON.stringify(parsed);
+        } catch (_) {
+            return text;
+        }
+    }
+    return text;
+}
+
+function parseHeroActivation(raw) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('ACCESS_NUMBER:')) return null;
+    const parts = text.split(':');
+    if (parts.length < 3) return null;
+    return {
+        id: String(parts[1] || '').trim(),
+        phone: String(parts[2] || '').trim()
+    };
+}
+
+function parseHeroStatusCode(raw) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('STATUS_OK:')) return '';
+    return text.slice('STATUS_OK:'.length).trim();
+}
+
+function parseHeroServicesCatalog(raw) {
+    const text = String(raw || '').trim();
+    if (!text || !text.startsWith('{')) return [];
+
+    try {
+        const parsed = JSON.parse(text);
+        const rows = Array.isArray(parsed && parsed.services) ? parsed.services : [];
+        const out = [];
+        for (const row of rows) {
+            const code = String((row && row.code) || '').trim().toLowerCase();
+            const name = String((row && row.name) || '').trim();
+            if (!/^[a-z0-9_]{2,32}$/i.test(code)) continue;
+            out.push({
+                code,
+                name,
+                nameLower: name.toLowerCase()
+            });
+        }
+        return out;
+    } catch (_) {
+        return [];
+    }
+}
+
+function parseHeroPricesByCountry(raw, country) {
+    const text = String(raw || '').trim();
+    if (!text || !text.startsWith('{')) return {};
+
+    try {
+        const parsed = JSON.parse(text);
+        const countryKey = String(country || '').trim();
+        const rows = parsed && parsed[countryKey] && typeof parsed[countryKey] === 'object'
+            ? parsed[countryKey]
+            : {};
+        const out = {};
+        for (const [serviceRaw, info] of Object.entries(rows)) {
+            const service = String(serviceRaw || '').trim().toLowerCase();
+            if (!service) continue;
+            const cost = Number(info && info.cost);
+            const count = Number(info && info.count);
+            const physicalCount = Number(info && info.physicalCount);
+            out[service] = {
+                cost: Number.isFinite(cost) ? cost : Infinity,
+                count: Number.isFinite(count) ? count : 0,
+                physicalCount: Number.isFinite(physicalCount) ? physicalCount : 0,
+                hasPrice: Number.isFinite(cost)
+            };
+        }
+        return out;
+    } catch (_) {
+        return {};
+    }
+}
+
+async function heroSmsFetchServiceCatalog() {
+    const raw = await heroSmsRequest({
+        action: 'getServicesList'
+    });
+    const services = parseHeroServicesCatalog(raw);
+    if (services.length === 0) {
+        throw new Error(`hero_sms_service_catalog_empty:${heroSmsErrorText(raw)}`);
+    }
+    return services;
+}
+
+async function heroSmsFetchPricesByCountry(country) {
+    const key = String(country || '').trim();
+    if (!key) return {};
+    if (heroSmsPricesByCountryCache.has(key)) {
+        return heroSmsPricesByCountryCache.get(key);
+    }
+
+    const raw = await heroSmsRequest({
+        action: 'getPrices',
+        country: key
+    });
+    const parsed = parseHeroPricesByCountry(raw, key);
+    heroSmsPricesByCountryCache.set(key, parsed);
+    return parsed;
+}
+
+function uniqLower(values) {
+    return Array.from(new Set(
+        (values || [])
+            .map((x) => String(x || '').trim().toLowerCase())
+            .filter(Boolean)
+    ));
+}
+
+async function heroSmsResolveServiceCandidates() {
+    if (Array.isArray(heroSmsServiceCandidatesCache) && heroSmsServiceCandidatesCache.length > 0) {
+        return heroSmsServiceCandidatesCache;
+    }
+
+    const explicit = uniqLower(HERO_SMS_SERVICES.filter((x) => !x.endsWith('*')));
+
+    const wildcardPrefixes = uniqLower([
+        ...HERO_SMS_SERVICES.filter((x) => x.endsWith('*')).map((x) => x.slice(0, -1)),
+        HERO_SMS_SERVICE.endsWith('*') ? HERO_SMS_SERVICE.slice(0, -1) : '',
+        HERO_SMS_SERVICE_PREFIX
+    ]);
+
+    const resolved = [...explicit];
+    if (wildcardPrefixes.length > 0 || HERO_SMS_SERVICE_QUERY) {
+        try {
+            const catalog = await heroSmsFetchServiceCatalog();
+            const catalogCodes = uniqLower(catalog.map((x) => x.code));
+            for (const prefix of wildcardPrefixes) {
+                const matches = catalogCodes.filter((code) => code.startsWith(prefix));
+                if (matches.length > 0) {
+                    resolved.push(...matches);
+                } else {
+                    const containsMatches = catalogCodes.filter((code) => code.includes(prefix));
+                    if (containsMatches.length > 0) {
+                        console.log(`Hero-SMS service prefix "${prefix}" returned 0 exact matches. Using contains matches: ${containsMatches.join(', ')}`);
+                        resolved.push(...containsMatches);
+                    } else {
+                        console.log(`Hero-SMS service prefix "${prefix}" returned 0 matches.`);
+                    }
+                }
+            }
+
+            if (HERO_SMS_SERVICE_QUERY) {
+                const queryMatches = catalog
+                    .filter((row) => row.code.includes(HERO_SMS_SERVICE_QUERY) || row.nameLower.includes(HERO_SMS_SERVICE_QUERY))
+                    .map((row) => row.code);
+                if (queryMatches.length > 0) {
+                    console.log(`Hero-SMS service query "${HERO_SMS_SERVICE_QUERY}" matched: ${uniqLower(queryMatches).join(', ')}`);
+                    resolved.push(...queryMatches);
+                } else {
+                    console.log(`Hero-SMS service query "${HERO_SMS_SERVICE_QUERY}" returned 0 matches.`);
+                }
+            }
+        } catch (err) {
+            console.log(`Hero-SMS service catalog unavailable: ${err.message}`);
+        }
+    }
+
+    const uniqueResolved = uniqLower(resolved);
+    if (uniqueResolved.length > 0) {
+        heroSmsServiceCandidatesCache = uniqueResolved;
+        console.log(`Hero-SMS service candidates: ${heroSmsServiceCandidatesCache.join(', ')}`);
+        return heroSmsServiceCandidatesCache;
+    }
+
+    heroSmsServiceCandidatesCache = [String(HERO_SMS_SERVICE || 'dr').trim().toLowerCase()].filter(Boolean);
+    console.log(`Hero-SMS fallback service: ${heroSmsServiceCandidatesCache.join(', ')}`);
+    return heroSmsServiceCandidatesCache;
+}
+
+function shouldRankByPrice() {
+    if (!HERO_SMS_PRICE_RANKING) return true;
+    return !['0', 'false', 'off', 'none', 'disabled'].includes(HERO_SMS_PRICE_RANKING);
+}
+
+function crossProductAcquirePlan(countries, services) {
+    const plan = [];
+    for (const country of countries) {
+        for (const service of services) {
+            plan.push({
+                country,
+                service,
+                hasPrice: false,
+                cost: Infinity,
+                count: 0,
+                physicalCount: 0
+            });
+        }
+    }
+    return plan;
+}
+
+async function heroSmsBuildAcquirePlan(countries, services) {
+    const basePlan = crossProductAcquirePlan(countries, services);
+    if (!shouldRankByPrice()) {
+        console.log('Hero-SMS ranking: disabled, using country/service order as configured.');
+        return basePlan;
+    }
+
+    const countryOrder = new Map(countries.map((country, idx) => [country, idx]));
+    const serviceOrder = new Map(services.map((service, idx) => [service, idx]));
+    const pricesByCountry = {};
+
+    for (const country of countries) {
+        try {
+            pricesByCountry[country] = await heroSmsFetchPricesByCountry(country);
+        } catch (err) {
+            pricesByCountry[country] = {};
+            console.log(`Hero-SMS getPrices country=${country} failed: ${err.message}`);
+        }
+    }
+
+    const withPrice = basePlan.map((item) => {
+        const info = pricesByCountry[item.country] && pricesByCountry[item.country][item.service]
+            ? pricesByCountry[item.country][item.service]
+            : null;
+        if (!info) return item;
+        return {
+            ...item,
+            hasPrice: !!info.hasPrice,
+            cost: info.cost,
+            count: info.count,
+            physicalCount: info.physicalCount
+        };
+    });
+
+    withPrice.sort((a, b) => {
+        if (a.hasPrice !== b.hasPrice) return a.hasPrice ? -1 : 1;
+        if (a.hasPrice && b.hasPrice && a.cost !== b.cost) return a.cost - b.cost;
+        if (a.count !== b.count) return b.count - a.count;
+        if (a.physicalCount !== b.physicalCount) return b.physicalCount - a.physicalCount;
+        const countryCmp = (countryOrder.get(a.country) ?? 0) - (countryOrder.get(b.country) ?? 0);
+        if (countryCmp !== 0) return countryCmp;
+        return (serviceOrder.get(a.service) ?? 0) - (serviceOrder.get(b.service) ?? 0);
+    });
+
+    const preview = withPrice.slice(0, 12).map((x) => (
+        `${x.country}/${x.service}:${x.hasPrice ? x.cost : 'n/a'}`
+    ));
+    console.log(`Hero-SMS ranking: price_asc. First candidates: ${preview.join(', ')}`);
+    return withPrice;
+}
+
+function heroSmsRequest(params, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const url = new URL(HERO_SMS_BASE_URL);
+        for (const [k, v] of Object.entries(params || {})) {
+            if (v !== undefined && v !== null && String(v) !== '') {
+                url.searchParams.set(k, String(v));
+            }
+        }
+        url.searchParams.set('api_key', HERO_SMS_API_KEY);
+
+        const req = https.get(url, { timeout: timeoutMs }, (res) => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => {
+                body += chunk;
+            });
+            res.on('end', () => {
+                if (res.statusCode && res.statusCode >= 400) {
+                    return reject(new Error(`hero_sms_http_${res.statusCode}:${heroSmsErrorText(body)}`));
+                }
+                resolve(String(body || '').trim());
+            });
+        });
+
+        req.on('timeout', () => {
+            req.destroy(new Error('hero_sms_timeout'));
+        });
+        req.on('error', (err) => reject(err));
+    });
+}
+
+async function heroSmsSetStatus(activationId, status) {
+    if (!activationId) return '';
+    try {
+        return await heroSmsRequest({
+            action: 'setStatus',
+            id: activationId,
+            status
+        });
+    } catch (err) {
+        return `ERR:${err.message}`;
+    }
+}
+
+async function heroSmsAcquireActivation() {
+    if (!HERO_SMS_API_KEY) {
+        throw new Error('hero_sms_api_key_missing');
+    }
+
+    const serviceCandidates = await heroSmsResolveServiceCandidates();
+    const acquirePlan = await heroSmsBuildAcquirePlan(HERO_SMS_COUNTRIES, serviceCandidates);
+    let lastReason = 'no_attempts';
+    for (const candidate of acquirePlan) {
+        const country = candidate.country;
+        const service = candidate.service;
+        const raw = await heroSmsRequest({
+            action: 'getNumber',
+            service,
+            country
+        });
+
+        const activation = parseHeroActivation(raw);
+        if (activation && activation.id && activation.phone) {
+            console.log(`Hero-SMS activation acquired: id=${activation.id}, country=${country}, service=${service}, price=${candidate.hasPrice ? candidate.cost : 'n/a'}, phone=${activation.phone}`);
+            return { ...activation, country, service, cost: candidate.hasPrice ? candidate.cost : null };
+        }
+
+        const reason = heroSmsErrorText(raw);
+        lastReason = `country=${country},service=${service},reason=${reason}`;
+        console.log(`Hero-SMS getNumber country=${country} service=${service} price=${candidate.hasPrice ? candidate.cost : 'n/a'}: ${reason}`);
+        if (!/NO_NUMBERS|SERVICE_NOT_AVAILABLE|BAD_SERVICE|BAD_COUNTRY|NO_BALANCE/i.test(reason)) {
+            break;
+        }
+    }
+
+    throw new Error(`hero_sms_get_number_failed:${lastReason}`);
+}
+
+async function heroSmsWaitForCode(activationId) {
+    const deadline = Date.now() + HERO_SMS_POLL_TIMEOUT_SEC * 1000;
+    let lastStatus = 'STATUS_WAIT_CODE';
+
+    while (Date.now() < deadline) {
+        const raw = await heroSmsRequest({
+            action: 'getStatus',
+            id: activationId
+        });
+        const status = String(raw || '').trim();
+        lastStatus = status;
+        const code = parseHeroStatusCode(status);
+        if (code) {
+            return code;
+        }
+        if (/STATUS_CANCEL|STATUS_WAIT_RETRY|BAD_STATUS|BAD_KEY/i.test(status)) {
+            throw new Error(`hero_sms_status_failed:${status}`);
+        }
+        await sleep(HERO_SMS_POLL_INTERVAL_MS);
+    }
+
+    throw new Error(`hero_sms_code_timeout:${lastStatus}`);
+}
+
+async function clickButtonByText(page, regex) {
+    const clicked = await page.evaluate((pattern) => {
+        const re = new RegExp(pattern, 'i');
+        const isVisible = (el) => {
+            const st = window.getComputedStyle(el);
+            return st.display !== 'none' && st.visibility !== 'hidden';
+        };
+        const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="submit"]'));
+        for (const el of nodes) {
+            if (!el || !isVisible(el)) continue;
+            if ('disabled' in el && el.disabled) continue;
+            const text = ((el.textContent || '') + ' ' + (el.value || '')).replace(/\s+/g, ' ').trim();
+            if (!text) continue;
+            if (re.test(text)) {
+                el.click();
+                return true;
+            }
+        }
+        return false;
+    }, regex.source || String(regex));
+    return !!clicked;
+}
+
+async function waitForAnySelector(page, selectors, timeoutMs) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        for (const selector of selectors) {
+            const handle = await page.$(selector).catch(() => null);
+            if (handle) return { selector, handle };
+        }
+        await sleep(250);
+    }
+    return null;
+}
+
+async function fillInputValue(page, input, value) {
+    await input.click({ clickCount: 3 }).catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
+    await input.click().catch(() => {});
+    for (const ch of String(value || '')) {
+        await page.keyboard.type(ch, { delay: 35 });
+    }
+}
+
+async function completePhoneVerificationWithHeroSMS(page) {
+    if (!HERO_SMS_API_KEY) {
+        return { success: false, reason: 'phone_required_hero_sms_api_key_missing' };
+    }
+
+    let activation = null;
+    try {
+        activation = await heroSmsAcquireActivation();
+        if (activation && activation.id) {
+            const statusResp = await heroSmsSetStatus(activation.id, 1);
+            console.log(`Hero-SMS setStatus(1): ${statusResp}`);
+        }
+
+        await takeScreenshot(page, '08d-phone-required');
+
+        const phoneInputResult = await waitForAnySelector(page, [
+            'input[type="tel"]',
+            'input[autocomplete="tel"]',
+            'input[name*="phone" i]',
+            'input[aria-label*="phone" i]',
+            'input[inputmode="tel"]'
+        ], 15000);
+
+        if (!phoneInputResult || !phoneInputResult.handle) {
+            throw new Error('phone_input_not_found');
+        }
+
+        const candidates = [`+${activation.phone}`, activation.phone];
+        let codeInputResult = null;
+        for (const phoneCandidate of candidates) {
+            console.log(`Trying phone candidate: ${phoneCandidate}`);
+            await fillInputValue(page, phoneInputResult.handle, phoneCandidate);
+            await sleep(400);
+
+            const sent = await clickButtonByText(page, /(send|sms|code|continue|next|verify|получ|отправ|код)/i);
+            if (!sent) {
+                const submit = await page.$('button[type="submit"], input[type="submit"]').catch(() => null);
+                if (submit) {
+                    await submit.click().catch(() => {});
+                }
+            }
+
+            codeInputResult = await waitForAnySelector(page, [
+                'input[autocomplete="one-time-code"]',
+                'input[name*="code" i]',
+                'input[placeholder*="code" i]',
+                'input[inputmode="numeric"][maxlength="6"]',
+                'input[maxlength="6"]'
+            ], 10000);
+
+            if (codeInputResult) break;
+        }
+
+        if (!codeInputResult || !codeInputResult.handle) {
+            throw new Error('sms_code_input_not_found');
+        }
+
+        console.log(`Waiting for Hero-SMS code (timeout=${HERO_SMS_POLL_TIMEOUT_SEC}s)...`);
+        const smsCode = await heroSmsWaitForCode(activation.id);
+        console.log(`Hero-SMS code received: ${smsCode}`);
+
+        const codeBoxes = await page.$$('input[inputmode="numeric"][maxlength="1"], input[maxlength="1"]').catch(() => []);
+        if (codeBoxes && codeBoxes.length >= 4 && smsCode.length >= 4) {
+            const digits = smsCode.split('');
+            for (let i = 0; i < codeBoxes.length && i < digits.length; i++) {
+                await fillInputValue(page, codeBoxes[i], digits[i]);
+            }
+        } else {
+            await fillInputValue(page, codeInputResult.handle, smsCode);
+        }
+
+        await clickButtonByText(page, /(verify|continue|next|confirm|submit|готов|подтверд)/i);
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        await sleep(2500);
+        await takeScreenshot(page, '08f-phone-verified');
+
+        const url = page.url();
+        if (url.includes('add-phone')) {
+            throw new Error('phone_verification_still_required');
+        }
+
+        if (activation && activation.id) {
+            const doneResp = await heroSmsSetStatus(activation.id, 6);
+            console.log(`Hero-SMS setStatus(6): ${doneResp}`);
+        }
+
+        return { success: true };
+    } catch (err) {
+        if (activation && activation.id) {
+            const cancelResp = await heroSmsSetStatus(activation.id, 8);
+            console.log(`Hero-SMS setStatus(8): ${cancelResp}`);
+        }
+        return { success: false, reason: `phone_required:${err.message}` };
+    }
+}
+
+async function applySteadyBrowserProfile(page, profile, engine) {
+    if (engine === 'puppeteer') {
+        await page.setUserAgent(profile.userAgent);
+        await page.setViewport(profile.viewport);
+        await page.setExtraHTTPHeaders({
+            'Accept-Language': profile.acceptLanguage
+        });
+        return;
+    }
+
+    if (typeof page.setViewportSize === 'function') {
+        await page.setViewportSize(profile.viewport).catch(() => {});
+    }
+
+    if (typeof page.context === 'function') {
+        const context = page.context();
+        if (context && typeof context.setExtraHTTPHeaders === 'function') {
+            await context.setExtraHTTPHeaders({
+                'Accept-Language': profile.acceptLanguage
+            }).catch(() => {});
+        }
+    }
+}
+
+async function launchBrowserPage({
+    launchArgs,
+    proxyConfig,
+    proxyServerArg,
+    shouldUseProxyChain,
+    browserProfile
+}) {
+    const engines = browserEngineOrder(BROWSER_ENGINE);
+    const launchErrors = [];
+
+    for (const engine of engines) {
+        try {
+            if (engine === 'puppeteer') {
+                const puppeteer = optionalRequire('puppeteer') || optionalRequire('puppeteer-core');
+                if (!puppeteer) {
+                    throw new Error('puppeteer module is not installed');
+                }
+
+                const launchOptions = {
+                    headless: 'new',
+                    args: launchArgs
+                };
+
+                const chromeExecutable = resolveChromeExecutable();
+                if (chromeExecutable) {
+                    launchOptions.executablePath = chromeExecutable;
+                } else {
+                    const playwright = optionalRequire('playwright');
+                    const playwrightExecutable = playwright && playwright.chromium && typeof playwright.chromium.executablePath === 'function'
+                        ? playwright.chromium.executablePath()
+                        : '';
+                    if (playwrightExecutable && fs.existsSync(playwrightExecutable)) {
+                        launchOptions.executablePath = playwrightExecutable;
+                        console.log(`Using Playwright Chromium executable for Puppeteer: ${playwrightExecutable}`);
+                    }
+                }
+
+                const browser = await puppeteer.launch(launchOptions);
+                const page = await browser.newPage();
+
+                if (proxyConfig && proxyConfig.username && !shouldUseProxyChain && typeof page.authenticate === 'function') {
+                    await page.authenticate({
+                        username: proxyConfig.username,
+                        password: proxyConfig.password
+                    });
+                }
+
+                return { engine, browser, page };
+            }
+
+            const playwright = optionalRequire('playwright');
+            if (!playwright || !playwright.chromium) {
+                throw new Error('playwright module is not installed');
+            }
+
+            const playwrightArgs = launchArgs.filter((arg) => !arg.startsWith('--proxy-server='));
+            const launchOptions = {
+                headless: true,
+                args: playwrightArgs
+            };
+
+            if (proxyServerArg) {
+                launchOptions.proxy = { server: proxyServerArg };
+            } else if (proxyConfig) {
+                const proxyOpts = { server: proxyConfig.server };
+                if (proxyConfig.username) {
+                    proxyOpts.username = proxyConfig.username;
+                    proxyOpts.password = proxyConfig.password || '';
+                }
+                launchOptions.proxy = proxyOpts;
+            }
+
+            const browser = await playwright.chromium.launch(launchOptions);
+            const context = await browser.newContext({
+                userAgent: browserProfile.userAgent,
+                viewport: browserProfile.viewport,
+                locale: 'en-US'
+            });
+            await context.setExtraHTTPHeaders({
+                'Accept-Language': browserProfile.acceptLanguage
+            }).catch(() => {});
+            const page = await context.newPage();
+
+            return { engine, browser, page };
+        } catch (error) {
+            const reason = String((error && error.message) || error || 'unknown_error');
+            launchErrors.push(`${engine}:${reason}`);
+            console.log(`Browser launch failed on ${engine}: ${reason}`);
+        }
+    }
+
+    throw new Error(`browser_launch_failed:${launchErrors.join(' | ')}`);
+}
+
+// Get verification code from Firstmail IMAP
+async function getVerificationCodeFromIMAP(email, password, waitSeconds = 60) {
+    console.log(`Waiting for verification email at ${email}...`);
+    
+    const IMAP_HOST = 'imap.firstmail.ltd';
+    const IMAP_PORT = 993;
+    
+    const startTime = Date.now();
+    let lastCount = 0;
+
+    try {
+        const initialResult = execSync(`python3 -c "
+import imaplib
+try:
+    imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+    imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+    status, msgs = imap.select('INBOX')
+    count = len(msgs[0].split()) if msgs[0] else 0
+    imap.close()
+    imap.logout()
+    print(count)
+except Exception:
+    print('0')
+"`, { encoding: 'utf8', timeout: 10000 });
+        lastCount = parseInt(initialResult.trim()) || 0;
+        console.log(`Initial inbox count: ${lastCount}`);
+    } catch (e) {
+        lastCount = 0;
+    }
+    
+    while (Date.now() - startTime < waitSeconds * 1000) {
+        try {
+            // Check message count using Python IMAP
+            const result = execSync(`python3 -c "
+import imaplib
+try:
+    imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+    imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+    status, msgs = imap.select('INBOX')
+    count = len(msgs[0].split()) if msgs[0] else 0
+    imap.close()
+    imap.logout()
+    print(count)
+except Exception as e:
+    print('0')
+"`, { encoding: 'utf8', timeout: 10000 });
+            
+            const count = parseInt(result.trim()) || 0;
+            
+            if (count > lastCount) {
+                // New email! Get the code
+                console.log(`New email received! Count: ${count}`);
+                
+                const emailResult = execSync(`python3 -c "
+import imaplib
+import email as email_lib
+import re
+
+imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+imap.select('INBOX')
+
+status, msgs = imap.search(None, 'ALL')
+if msgs[0]:
+    msg_nums = msgs[0].split()[-1:]
+    for num in msg_nums:
+        status, data = imap.fetch(num, '(RFC822)')
+        if data[0]:
+            msg = email_lib.message_from_bytes(data[0][1])
+            subject = msg.get('Subject', '')
+            
+            body = ''
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode('utf-8', errors='ignore')
+            
+            text = subject + ' ' + body
+            
+            # Look for 6-digit code
+            match = re.search(r'\\b\\d{6}\\b', text)
+            if match:
+                print(match.group())
+            else:
+                print('')
+            
+            break
+
+imap.close()
+imap.logout()
+"`, { encoding: 'utf8', timeout: 10000 });
+                
+                const code = emailResult.trim();
+                if (code && code.match(/^\d{6}$/)) {
+                    console.log(`✓ Verification code: ${code}`);
+                    return code;
+                }
+            }
+            
+            lastCount = count;
+        } catch (error) {
+            console.log(`IMAP check error: ${error.message}`);
+        }
+        
+        await new Promise(r => setTimeout(r, 3000));
+    }
+    
+    // Fallback: use latest inbox message code when count did not change (race condition).
+    try {
+        console.log('No new email detected. Trying latest message code as fallback...');
+        const latestCodeResult = execSync(`python3 -c "
+import imaplib
+import email as email_lib
+import re
+
+imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+imap.select('INBOX')
+
+status, msgs = imap.search(None, 'ALL')
+if msgs[0]:
+    msg_nums = msgs[0].split()[-1:]
+    for num in msg_nums:
+        status, data = imap.fetch(num, '(RFC822)')
+        if data[0]:
+            msg = email_lib.message_from_bytes(data[0][1])
+            subject = msg.get('Subject', '')
+            body = ''
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode('utf-8', errors='ignore')
+            text = subject + ' ' + body
+            match = re.search(r'\\b\\d{6}\\b', text)
+            if match:
+                print(match.group())
+            else:
+                print('')
+            break
+imap.close()
+imap.logout()
+"`, { encoding: 'utf8', timeout: 10000 });
+        const latestCode = latestCodeResult.trim();
+        if (latestCode && latestCode.match(/^\d{6}$/)) {
+            console.log(`✓ Fallback verification code: ${latestCode}`);
+            return latestCode;
+        }
+    } catch (e) {
+        // ignore fallback errors
+    }
+
+    console.log('✗ Timeout waiting for verification code');
+    return null;
+}
+
+async function takeScreenshot(page, name) {
+    try {
+        await page.screenshot({ path: `/tmp/codex-login-${name}.png`, fullPage: false });
+        console.log(`Screenshot saved: /tmp/codex-login-${name}.png`);
+    } catch (e) {
+        console.log(`Failed to take screenshot: ${e.message}`);
+    }
+}
+
+async function detectKnownRouteError(page) {
+    const text = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '');
+    if (/oops,\s*an error occurred!/i.test(text) && /invalid content type/i.test(text)) {
+        return 'route_error_invalid_content_type';
+    }
+    if (/oops,\s*an error occurred!/i.test(text) && /not valid json/i.test(text)) {
+        return 'route_error_invalid_json';
+    }
+    if (/route error/i.test(text) && /(400|401|403|429|5\d\d)/.test(text)) {
+        return 'route_error_http';
+    }
+    return null;
+}
+
+async function tryRecoverFromRouteError(page, maxRetries = 2) {
+    for (let i = 1; i <= maxRetries; i++) {
+        const currentError = await detectKnownRouteError(page);
+        if (!currentError) {
+            return true;
+        }
+
+        console.log(`Attempting route-error recovery (${i}/${maxRetries})...`);
+        const waitNav = page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+        const clicked = await page.evaluate(() => {
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+            const btn = nodes.find((el) => /try again|retry/i.test((el.textContent || '').trim()));
+            if (!btn) return false;
+            btn.click();
+            return true;
+        });
+        if (!clicked) {
+            return false;
+        }
+
+        await waitNav;
+        await new Promise(r => setTimeout(r, 2500));
+        await takeScreenshot(page, `03r-route-recovery-${i}`);
+
+        const stillError = await detectKnownRouteError(page);
+        if (!stillError) {
+            console.log('Route-error recovery succeeded.');
+            return true;
+        }
+    }
+    return false;
+}
+
+async function waitForPasswordOrKnownError(page, timeoutMs = 12000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        const passwordInput = await page.$('input[type="password"]');
+        if (passwordInput) {
+            return { state: 'password', input: passwordInput };
+        }
+
+        const knownError = await detectKnownRouteError(page);
+        if (knownError) {
+            return { state: 'error', reason: knownError };
+        }
+
+        await new Promise(r => setTimeout(r, 400));
+    }
+    return { state: 'timeout', reason: 'password_input_timeout' };
+}
+
+async function switchToSignInFlow(page, account, authUrl) {
+    console.log('Navigating back to OAuth authUrl for Sign In flow...');
+    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await takeScreenshot(page, '06c-login-page');
+    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
+
+    // Enter email for Sign In
+    console.log('Entering email for Sign In...');
+    const signInEmail = await page.$('input[type="email"]');
+    if (signInEmail) {
+        await signInEmail.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await signInEmail.click();
+        for (const char of account.email) {
+            await page.keyboard.type(char, { delay: 50 });
+        }
+    }
+
+    const signInContinue = await page.$('button[type="submit"]');
+    if (signInContinue) {
+        await signInContinue.click();
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    }
+
+    await takeScreenshot(page, '06d-signin-email');
+
+    // Wait a bit for the page to transition to password field
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Check if password field is visible, if not click Continue again
+    const pwdFieldVisible = await page.$('input[type="password"]');
+    if (!pwdFieldVisible) {
+        console.log('Password field not visible, clicking Continue...');
+        const continueAfterEmail = await page.$('button[type="submit"]');
+        if (continueAfterEmail) {
+            await continueAfterEmail.click();
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        }
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // Now wait for password field and enter password
+    console.log('Waiting for password field...');
+    await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+
+    console.log('Entering password for Sign In...');
+    const signInPwd = await page.$('input[type="password"]');
+    if (signInPwd) {
+        await signInPwd.click({ clickCount: 3 });
+        await page.keyboard.press('Backspace');
+        await signInPwd.click();
+        for (const char of account.password) {
+            await page.keyboard.type(char, { delay: 50 });
+        }
+    }
+
+    const signInSubmit = await page.$('button[type="submit"]');
+    if (signInSubmit) {
+        await signInSubmit.click();
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    }
+
+    await takeScreenshot(page, '06e-signin-password');
+    console.log('Password submitted for Sign In');
+
+    return page.url();
+}
+
+async function performLogin(authUrl) {
+    const effectiveAuthUrl = normalizeAuthUrl(authUrl);
+    if (effectiveAuthUrl !== authUrl) {
+        console.log('Auth URL normalized: removed unstable simplified-flow query param');
+    }
+
+    const proxyScheme = normalizeProxyScheme(process.env.CODEX_PROXY_SCHEME || 'http');
+    const proxyRaw = process.env.CODEX_PROXY_ENTRY || '';
+    let proxyConfig = null;
+    let browser = null;
+    let page = null;
+    let browserEngine = 'puppeteer';
+    let anonymizedProxyUrl = null;
+    const forceProxyChain = process.env.CODEX_PROXY_FORCE_CHAIN === '1';
+
+    if (proxyRaw) {
+        try {
+            proxyConfig = parseProxyEntry(proxyRaw, proxyScheme);
+            console.log(`Using proxy: ${proxyConfig.server}`);
+        } catch (e) {
+            return { success: false, reason: `invalid_proxy:${e.message}` };
+        }
+    }
+
+    try {
+        let proxyServerArg = null;
+        const shouldUseProxyChain = !!(proxyConfig && proxyConfig.username && (forceProxyChain || proxyConfig.scheme.startsWith('socks')));
+        if (proxyConfig) {
+            if (shouldUseProxyChain) {
+                if (proxyConfig.scheme === 'https') {
+                    anonymizedProxyUrl = await proxyChain.anonymizeProxy({
+                        url: proxyConfig.upstreamUrl,
+                        port: 0,
+                        ignoreProxyCertificate: true
+                    });
+                } else {
+                    anonymizedProxyUrl = await proxyChain.anonymizeProxy(proxyConfig.upstreamUrl);
+                }
+                proxyServerArg = anonymizedProxyUrl;
+                console.log(`Using local proxy bridge: ${proxyServerArg}`);
+            } else {
+                proxyServerArg = proxyConfig.server;
+                if (proxyConfig.username) {
+                    console.log('Using direct browser proxy auth mode (no proxy-chain bridge)');
+                }
+            }
+        }
+
+        const launchArgs = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--ignore-certificate-errors',
+            '--lang=en-US,en'
+        ];
+        if (proxyServerArg) {
+            launchArgs.push(`--proxy-server=${proxyServerArg}`);
+            launchArgs.push('--proxy-bypass-list=localhost,127.0.0.1,<local>');
+        }
+
+        const browserProfile = buildBrowserProfile();
+        const launched = await launchBrowserPage({
+            launchArgs,
+            proxyConfig,
+            proxyServerArg,
+            shouldUseProxyChain,
+            browserProfile
+        });
+        browser = launched.browser;
+        page = launched.page;
+        browserEngine = launched.engine;
+        console.log(`Browser engine selected: ${browserEngine}`);
+
+        page.on('pageerror', (err) => {
+            console.log(`[PAGEERROR] ${err.message}`);
+        });
+        page.on('console', (msg) => {
+            const text = msg.text();
+            if (msg.type() === 'error' || /\b(error|exception|failed)\b/i.test(text)) {
+                console.log(`[CONSOLE:${msg.type()}] ${text}`);
+            }
+        });
+
+        await applySteadyBrowserProfile(page, browserProfile, browserEngine);
+
+        // Track all URLs for callback extraction - intercept requests BEFORE they happen
+        let callbackUrl = null;
+        let localRedirectUrl = null;
+        let lastUrl = authUrl;
+        
+        // Listen for all requests
+        page.on('request', (request) => {
+            const url = request.url();
+            if (isCodexCallbackUrl(url)) {
+                callbackUrl = url;
+                console.log(`[REQUEST] Callback URL intercepted: ${url}`);
+            } else if (url.includes('localhost:1455')) {
+                localRedirectUrl = url;
+                console.log(`[REQUEST] Local redirect without code: ${url}`);
+            }
+            lastUrl = url;
+        });
+        
+        // Listen for responses
+        page.on('response', (response) => {
+            const url = response.url();
+            const status = response.status();
+            if (url.includes('auth.openai.com') && status >= 400) {
+                const headers = response.headers();
+                const contentType = headers['content-type'] || headers['Content-Type'] || '';
+                console.log(`[HTTP ${status}] ${url} content-type=${contentType}`);
+            }
+            if (!callbackUrl && isCodexCallbackUrl(url)) {
+                callbackUrl = url;
+                console.log(`[RESPONSE] Callback URL from response: ${url}`);
+            } else if (url.includes('localhost:1455')) {
+                localRedirectUrl = url;
+            }
+        });
+        
+        // Listen for frame navigation
+        page.on('framenavigated', (frame) => {
+            const url = frame.url();
+            if (!callbackUrl && isCodexCallbackUrl(url)) {
+                callbackUrl = url;
+                console.log(`[FRAME] Callback URL from frame: ${url}`);
+            } else if (url.includes('localhost:1455')) {
+                localRedirectUrl = url;
+            }
+        });
+
+        console.log('Navigating to auth page...');
+        let lastGotoError = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await page.goto(effectiveAuthUrl, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 60000
+                });
+                lastGotoError = null;
+                break;
+            } catch (e) {
+                lastGotoError = e;
+                console.log(`Auth page navigation attempt ${attempt}/3 failed: ${e.message}`);
+                await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+        if (lastGotoError) {
+            throw lastGotoError;
+        }
+        await takeScreenshot(page, '01-initial');
+        await new Promise(r => setTimeout(r, 3000));
+
+        // Wait for email input
+        console.log('Waiting for email input...');
+        await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
+
+        // Default behavior is Sign In. Enable Sign Up explicitly when needed.
+        const enableSignUpFlow = process.env.CODEX_ENABLE_SIGNUP_FLOW === '1' || ACCOUNT.forceSignUp === true;
+        if (enableSignUpFlow) {
+            console.log('CODEX_ENABLE_SIGNUP_FLOW=1: checking for Sign Up/Create account controls...');
+            const signUpClicked = await page.evaluate(() => {
+                const looksVisible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    return style && style.display !== 'none' && style.visibility !== 'hidden';
+                };
+                const patterns = [/sign up/i, /create account/i, /register/i, /continue with email/i, /use email/i];
+                const nodes = Array.from(document.querySelectorAll('a,button,[role="button"]'));
+                for (const node of nodes) {
+                    if (!node || !looksVisible(node)) continue;
+                    const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                    const href = String(node.getAttribute && node.getAttribute('href') || '');
+                    const hasMatch = patterns.some((re) => re.test(text)) || /signup|register|create-account/i.test(href);
+                    if (!hasMatch) continue;
+                    node.click();
+                    return text || href || 'clicked';
+                }
+                return '';
+            });
+
+            if (signUpClicked) {
+                console.log(`Sign Up/Create account clicked: ${signUpClicked}`);
+                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
+                await new Promise(r => setTimeout(r, 2500));
+                await takeScreenshot(page, '01b-after-signup');
+            }
+        } else {
+            console.log('Sign In mode: skipping Sign Up link click');
+        }
+
+        // Enter email
+        console.log('Entering email...');
+        const emailInput = await page.$('input[type="email"], input[name="email"]');
+        if (emailInput) {
+            await emailInput.click({ clickCount: 3 });
+            await page.keyboard.press('Backspace');
+            await emailInput.click();
+            for (const char of ACCOUNT.email) {
+                await page.keyboard.type(char, { delay: Math.random() * 50 + 50 });
+            }
+        }
+        await new Promise(r => setTimeout(r, 1000));
+        await takeScreenshot(page, '02-email-entered');
+
+        // Click Continue and wait for navigation
+        console.log('Clicking Continue...');
+        const continueBtn = await page.$('button[type="submit"]') ||
+                           await firstXPath(page, '//button[contains(text(), "Continue")]');
+        if (continueBtn) {
+            await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+                continueBtn.click().catch(() => {})
+            ]);
+        }
+        await new Promise(r => setTimeout(r, 2000));
+        await takeScreenshot(page, '03-after-email');
+        console.log(`After email - URL: ${page.url()}`);
+
+        const immediateRouteError = await detectKnownRouteError(page);
+        if (immediateRouteError) {
+            console.log(`Known route error detected after email step: ${immediateRouteError}`);
+            await takeScreenshot(page, '03b-route-error');
+            const recovered = await tryRecoverFromRouteError(page, 2);
+            if (!recovered) {
+                return { success: false, reason: immediateRouteError };
+            }
+        }
+
+        // Wait for password input (or quickly fail on known route error page)
+        console.log('Waiting for password input...');
+        let passwordStep = await waitForPasswordOrKnownError(page, 12000);
+        if (passwordStep.state === 'timeout' && page.url().includes('/log-in')) {
+            console.log('Password input not visible yet on /log-in, clicking Continue once more...');
+            const continueAfterEmail = await page.$('button[type="submit"]');
+            if (continueAfterEmail) {
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {}),
+                    continueAfterEmail.click().catch(() => {})
+                ]);
+                await new Promise(r => setTimeout(r, 1500));
+                await takeScreenshot(page, '03d-second-continue');
+                passwordStep = await waitForPasswordOrKnownError(page, 10000);
+            }
+        }
+
+        let pageUrl = page.url();
+        if (passwordStep.state === 'error') {
+            console.log(`Known route error before password input: ${passwordStep.reason}`);
+            await takeScreenshot(page, '03b-route-error');
+            const recovered = await tryRecoverFromRouteError(page, 2);
+            if (!recovered) {
+                return { success: false, reason: passwordStep.reason };
+            }
+            // Re-check password after route-error recovery.
+            passwordStep = await waitForPasswordOrKnownError(page, 10000);
+            if (passwordStep.state === 'error') {
+                return { success: false, reason: passwordStep.reason };
+            }
+        }
+
+        if (passwordStep.state === 'password') {
+            console.log('Password input found');
+
+            // Enter password
+            console.log('Entering password...');
+            const passwordInput = passwordStep.input;
+            if (passwordInput) {
+                await passwordInput.click({ clickCount: 3 });
+                await page.keyboard.press('Backspace');
+                await passwordInput.click();
+                for (const char of ACCOUNT.password) {
+                    await page.keyboard.type(char, { delay: Math.random() * 50 + 50 });
+                }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+            await takeScreenshot(page, '04-password-entered');
+
+            // Submit password
+            console.log('Submitting password...');
+            await new Promise(r => setTimeout(r, 500));
+            
+            const submitBtn = await page.$('button[type="submit"]') ||
+                             await firstXPath(page, '//button[contains(text(), "Continue") or contains(text(), "Next")]');
+            if (submitBtn) {
+                console.log('Found submit button, clicking...');
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+                    submitBtn.click().catch(() => {})
+                ]);
+            } else {
+                console.log('Submit button not found, trying Enter key...');
+                await page.keyboard.press('Enter');
+                await new Promise(r => setTimeout(r, 3000));
+            }
+            await new Promise(r => setTimeout(r, 5000));
+            await takeScreenshot(page, '05-after-password');
+
+            pageUrl = page.url();
+            console.log(`After password - URL: ${pageUrl}`);
+
+            // Retry if still on password page
+            if (pageUrl.includes('log-in/password')) {
+                console.log('Still on password page, retrying submit...');
+                await page.keyboard.press('Enter');
+                await new Promise(r => setTimeout(r, 5000));
+                await takeScreenshot(page, '05b-retry');
+                pageUrl = page.url();
+                console.log(`After retry - URL: ${pageUrl}`);
+            }
+        } else {
+            const knownAfterTimeout = await detectKnownRouteError(page);
+            if (knownAfterTimeout) {
+                console.log(`Known route error on password timeout: ${knownAfterTimeout}`);
+                await takeScreenshot(page, '03b-route-error');
+                return { success: false, reason: knownAfterTimeout };
+            }
+
+            if (pageUrl.includes('email-verification')) {
+                console.log('Password step skipped, email verification screen is already open.');
+            } else {
+                await takeScreenshot(page, '03c-password-missing');
+                return { success: false, reason: `password_input_missing_after_email:${pageUrl}` };
+            }
+        }
+
+        // Check if this is Sign Up flow (email verification) vs Sign In flow (MFA)
+        const isSignUpFlow = pageUrl.includes('email-verification') ||
+                             pageUrl.includes('create-account') ||
+                             pageUrl.includes('about-you') ||
+                             pageUrl.includes('add-phone');
+        
+        // Step 3: Get verification code
+        if (isSignUpFlow) {
+            const signUpPageContent = await page.content();
+            const accountAlreadyExists = /already exists/i.test(signUpPageContent);
+            if (accountAlreadyExists) {
+                console.log('Account already exists on Sign Up page - switching to Sign In flow...');
+                pageUrl = await switchToSignInFlow(page, ACCOUNT, effectiveAuthUrl);
+            } else {
+            // Sign Up flow - get code from email via IMAP
+            console.log('Sign Up flow detected - waiting for email verification code...');
+            const emailCode = await getVerificationCodeFromIMAP(ACCOUNT.email, ACCOUNT.password);
+            
+            if (emailCode) {
+                console.log(`Email verification code: ${emailCode}`);
+                console.log('Entering email verification code...');
+                
+                const codeInput = await page.$('input[type="text"][maxlength="6"], input[placeholder*="code" i], input[name="code"]');
+                if (codeInput) {
+                    await codeInput.click({ clickCount: 3 });
+                    await page.keyboard.press('Backspace');
+                    await codeInput.click();
+                    for (const char of emailCode) {
+                        await page.keyboard.type(char, { delay: 100 });
+                    }
+                }
+                
+                // Submit code
+                const codeSubmitBtn = await page.$('button[type="submit"]') ||
+                                     await firstXPath(page, '//button[contains(text(), "Continue") or contains(text(), "Verify")]');
+                if (codeSubmitBtn) {
+                    await codeSubmitBtn.click();
+                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                } else {
+                    // Try Enter key
+                    await page.keyboard.press('Enter');
+                }
+
+                await new Promise(r => setTimeout(r, 5000));
+                await takeScreenshot(page, '06-email-verified');
+                console.log('Email verified');
+                
+                // Check if we're still on create-account page (account exists)
+                const currentPageUrl = page.url();
+                if (currentPageUrl.includes('create-account') || currentPageUrl.includes('email-verification')) {
+                    console.log('Still on verification page - trying to continue...');
+                    
+                    // Try clicking Continue button
+                    const continueBtn = await page.$('button[type="submit"]') ||
+                                       await firstXPath(page, '//button[contains(text(), "Continue")]');
+                    if (continueBtn) {
+                        await continueBtn.click();
+                        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                        await takeScreenshot(page, '06b-continue-clicked');
+                    }
+                    
+                    // If still on same page, try going to /login
+                    const afterUrl = page.url();
+                    if (afterUrl.includes('create-account') || afterUrl.includes('email-verification')) {
+                        pageUrl = await switchToSignInFlow(page, ACCOUNT, effectiveAuthUrl);
+                    }
+                }
+            } else {
+                console.log('Failed to get email verification code');
+            }
+            }
+        } else {
+            const totpInput = await page.$('input[type="text"][maxlength="6"], input[placeholder*="code" i], input[name="code"]');
+            if (totpInput) {
+                const isVisible = await totpInput.evaluate(el => {
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none' && style.visibility !== 'hidden';
+                });
+                if (isVisible) {
+                    if (!ACCOUNT.totpSecret) {
+                        console.log('2FA challenge detected, but account has no totpSecret');
+                        await takeScreenshot(page, '06-2fa-secret-missing');
+                        return { success: false, reason: '2FA challenge detected but totpSecret is missing' };
+                    }
+
+                    // Sign In flow - use TOTP 2FA
+                    console.log('Getting fresh 2FA code...');
+                    const totpCode = getTOTPCode(ACCOUNT.totpSecret);
+                    console.log(`2FA Code: ${totpCode}`);
+
+                    console.log('Entering 2FA code...');
+                    await totpInput.click({ clickCount: 3 });
+                    await page.keyboard.press('Backspace');
+                    await totpInput.click();
+                    for (const char of totpCode) {
+                        await page.keyboard.type(char, { delay: Math.random() * 50 + 50 });
+                    }
+                }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+            await takeScreenshot(page, '06-2fa-entered');
+
+            // Submit 2FA
+            console.log('Submitting 2FA...');
+            const totpBtn = await page.$('button[type="submit"]') ||
+                           await firstXPath(page, '//button[contains(text(), "Continue") or contains(text(), "Verify") or contains(text(), "Confirm")]');
+            if (totpBtn) {
+                await Promise.all([
+                    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+                    totpBtn.click().catch(() => {})
+                ]);
+            } else {
+                await page.keyboard.press('Enter');
+            }
+            await new Promise(r => setTimeout(r, 8000));
+            await takeScreenshot(page, '07-after-2fa');
+        }
+
+        // Some sign-in paths also require email verification code.
+        pageUrl = page.url();
+        if (pageUrl.includes('email-verification')) {
+            console.log('Email verification page detected after sign-in. Getting code from IMAP...');
+            const signInEmailCode = await getVerificationCodeFromIMAP(ACCOUNT.email, ACCOUNT.password, 90);
+            if (signInEmailCode) {
+                console.log(`Email verification code: ${signInEmailCode}`);
+                const verifyCodeInput = await page.$('input[type="text"][maxlength="6"], input[placeholder*="code" i], input[name="code"]');
+                if (verifyCodeInput) {
+                    await verifyCodeInput.click({ clickCount: 3 }).catch(() => {});
+                    await page.keyboard.press('Backspace').catch(() => {});
+                    await verifyCodeInput.click().catch(() => {});
+                    for (const char of signInEmailCode) {
+                        await page.keyboard.type(char, { delay: 90 });
+                    }
+                }
+                const verifySubmitBtn = await page.$('button[type="submit"]') ||
+                                        await firstXPath(page, '//button[contains(text(), "Continue") or contains(text(), "Verify")]');
+                if (verifySubmitBtn) {
+                    await verifySubmitBtn.click();
+                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                } else {
+                    await page.keyboard.press('Enter').catch(() => {});
+                }
+                await new Promise(r => setTimeout(r, 3000));
+                await takeScreenshot(page, '07b-email-verified-post-signin');
+            } else {
+                console.log('Failed to get email verification code for post-signin verification');
+            }
+        }
+
+        // Step 4: Handle consent page OR about-you page (Sign Up flow)
+        console.log('Checking for consent/about-you screen...');
+        let newPageUrl = page.url();
+        console.log(`Current URL: ${newPageUrl}`);
+
+        // Check if we're on the about-you page (Sign Up flow)
+        const isAboutYouPage = newPageUrl.includes('about-you');
+        if (isAboutYouPage) {
+            console.log('About-you page detected - entering name and DOB...');
+            const fullName = buildValidFullName(ACCOUNT.name, ACCOUNT.email);
+            console.log(`Using full name: ${fullName}`);
+            
+            // Enter name
+            const nameInput = await page.$('input[name*="name"], input[placeholder*="name" i], input[aria-label*="name" i]');
+            if (nameInput) {
+                console.log('Entering name...');
+                await nameInput.click({ clickCount: 3 });
+                await page.keyboard.press('Backspace');
+                await nameInput.click();
+                await page.keyboard.type(fullName, { delay: 50 });
+            }
+            
+            // Enter age/birthday (varies by locale and experiment bucket)
+            const birthYear = ACCOUNT.birthYear || 2000;
+            const birthMonth = String(ACCOUNT.birthMonth || 1).padStart(2, '0');
+            const birthDay = String(ACCOUNT.birthDay || 15).padStart(2, '0');
+            const dobDisplay = `${birthMonth}/${birthDay}/${birthYear}`;
+            const dobISO = `${birthYear}-${birthMonth}-${birthDay}`;
+            const ageValue = String(new Date().getFullYear() - birthYear);
+
+            const aboutYouText = await page.content();
+            const isAgePrompt = /how old are you\?/i.test(aboutYouText) ||
+                                /placeholder="[^"]*age/i.test(aboutYouText) ||
+                                />\s*Age\s*</i.test(aboutYouText);
+
+            console.log(`Entering age/birthday: mode=${isAgePrompt ? 'age' : 'birthday'}, age=${ageValue}, dob=${dobDisplay}`);
+
+            let ageDobValue = '';
+            let usedSpinbuttonDateField = false;
+
+            const monthSegment = await page.$('div[role="spinbutton"][data-type="month"]');
+            const daySegment = await page.$('div[role="spinbutton"][data-type="day"]');
+            const yearSegment = await page.$('div[role="spinbutton"][data-type="year"]');
+
+            if (monthSegment && daySegment && yearSegment) {
+                console.log('Filling birthday via spinbutton segments...');
+                const fillSegment = async (handle, value) => {
+                    await handle.click({ clickCount: 3 }).catch(() => {});
+                    await page.keyboard.press('Backspace').catch(() => {});
+                    await handle.click().catch(() => {});
+                    await page.keyboard.type(value, { delay: 40 });
+                };
+
+                await fillSegment(monthSegment, String(Number(birthMonth)));
+                await fillSegment(daySegment, String(Number(birthDay)));
+                await fillSegment(yearSegment, String(birthYear));
+
+                const hiddenAfterSegment = await page.$('input[name="birthday"]');
+                if (hiddenAfterSegment) {
+                    ageDobValue = await hiddenAfterSegment.evaluate(el => el.value || '');
+                }
+                usedSpinbuttonDateField = true;
+            }
+
+            if (!usedSpinbuttonDateField) {
+                const allInputs = await page.$$('input');
+                let ageDobInput = null;
+                if (allInputs.length >= 2) {
+                    ageDobInput = allInputs[1];
+                } else {
+                    ageDobInput = await page.$(
+                        'input[name*="birth" i], input[id*="birth" i], input[placeholder*="birth" i], input[aria-label*="birth" i], input[placeholder*="age" i], input[aria-label*="age" i], input[autocomplete="bday"], input[type="date"]'
+                    );
+                }
+
+                if (ageDobInput) {
+                    await ageDobInput.click({ clickCount: 3 }).catch(() => {});
+                    await page.keyboard.press('Backspace').catch(() => {});
+                    await ageDobInput.click().catch(() => {});
+                    if (isAgePrompt) {
+                        await page.keyboard.type(ageValue, { delay: 50 });
+                    } else {
+                        await page.keyboard.type(dobDisplay, { delay: 50 });
+                    }
+                    ageDobValue = await ageDobInput.evaluate(el => el.value || '');
+                }
+            }
+            console.log(`Age/Birthday field value after typing: ${ageDobValue}`);
+
+            // Fallback: try forcing hidden birthday value if spinbutton/input typing did not update it.
+            const hiddenBirthdayInput = await page.$('input[name="birthday"]');
+            if (hiddenBirthdayInput && !usedSpinbuttonDateField) {
+                await hiddenBirthdayInput.evaluate((el, iso) => {
+                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                    if (setter) {
+                        setter.call(el, iso);
+                    } else {
+                        el.value = iso;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }, dobISO);
+                const hiddenBirthdayValue = await hiddenBirthdayInput.evaluate(el => el.value || '');
+                console.log(`Hidden birthday value set to: ${hiddenBirthdayValue}`);
+            }
+            
+            await new Promise(r => setTimeout(r, 1000));
+            await takeScreenshot(page, '08-about-you-filled');
+            
+            // Submit
+            const finishBtn = await page.$('button[type="submit"]') ||
+                             await firstXPath(page, '//button[contains(text(), "Finish")]');
+            if (finishBtn) {
+                console.log('Submitting name/DOB...');
+                await finishBtn.click();
+                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            }
+            
+            await new Promise(r => setTimeout(r, 5000));
+            await takeScreenshot(page, '08b-about-you-submitted');
+
+            // Retry once if we're still on about-you (usually invalid DOB format/value).
+            if (page.url().includes('about-you')) {
+                console.log('Still on about-you page, retrying age/birthday submission...');
+                const aboutYouRetryText = await page.content();
+                const nameLooksInvalid = /doesn'?t look right|try again|invalid name/i.test(aboutYouRetryText);
+                if (nameLooksInvalid) {
+                    const retryNameInput = await page.$('input[name*="name"], input[placeholder*="name" i], input[aria-label*="name" i]');
+                    if (retryNameInput) {
+                        const fallbackFullName = 'Alex Stone';
+                        console.log(`Name validation warning detected. Retrying with fallback name: ${fallbackFullName}`);
+                        await retryNameInput.click({ clickCount: 3 }).catch(() => {});
+                        await page.keyboard.press('Backspace').catch(() => {});
+                        await retryNameInput.click().catch(() => {});
+                        await page.keyboard.type(fallbackFullName, { delay: 40 }).catch(() => {});
+                    }
+                }
+                const retryDobInput = await page.$(
+                    'input[name*="birth" i], input[id*="birth" i], input[placeholder*="birth" i], input[aria-label*="birth" i], input[placeholder*="age" i], input[aria-label*="age" i], input[autocomplete="bday"], input[type="date"]'
+                );
+                const retryMonth = await page.$('div[role="spinbutton"][data-type="month"]');
+                const retryDay = await page.$('div[role="spinbutton"][data-type="day"]');
+                const retryYear = await page.$('div[role="spinbutton"][data-type="year"]');
+                if (retryMonth && retryDay && retryYear) {
+                    const fillRetrySegment = async (handle, value) => {
+                        await handle.click({ clickCount: 3 }).catch(() => {});
+                        await page.keyboard.press('Backspace').catch(() => {});
+                        await handle.click().catch(() => {});
+                        await page.keyboard.type(value, { delay: 35 });
+                    };
+                    await fillRetrySegment(retryMonth, String(Number(birthMonth)));
+                    await fillRetrySegment(retryDay, String(Number(birthDay)));
+                    await fillRetrySegment(retryYear, String(birthYear));
+                } else if (retryDobInput) {
+                    await retryDobInput.click({ clickCount: 3 }).catch(() => {});
+                    await page.keyboard.press('Backspace').catch(() => {});
+                    await retryDobInput.click().catch(() => {});
+                    if (isAgePrompt) {
+                        await page.keyboard.type(ageValue, { delay: 40 });
+                    } else {
+                        await page.keyboard.type(dobDisplay, { delay: 40 });
+                    }
+                }
+                const retryHiddenBirthdayInput = await page.$('input[name="birthday"]');
+                if (retryHiddenBirthdayInput) {
+                    await retryHiddenBirthdayInput.evaluate((el, iso) => {
+                        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) {
+                            setter.call(el, iso);
+                        } else {
+                            el.value = iso;
+                        }
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }, dobISO);
+                }
+                const retryFinishBtn = await page.$('button[type="submit"]') ||
+                                      await firstXPath(page, '//button[contains(text(), "Finish")]');
+                if (retryFinishBtn) {
+                    await retryFinishBtn.click();
+                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+                }
+                await new Promise(r => setTimeout(r, 5000));
+                await takeScreenshot(page, '08c-about-you-retry');
+            }
+            
+            newPageUrl = page.url();
+            console.log(`After about-you - URL: ${newPageUrl}`);
+        }
+
+        if (newPageUrl.includes('add-phone')) {
+            console.log('Phone number required by OpenAI. Attempting Hero-SMS activation flow...');
+            const phoneResult = await completePhoneVerificationWithHeroSMS(page);
+            if (!phoneResult.success) {
+                return { success: false, reason: phoneResult.reason || 'phone_required' };
+            }
+            newPageUrl = page.url();
+            console.log(`After phone verification - URL: ${newPageUrl}`);
+        }
+
+        // Check if we're on the consent page
+        const isConsentPage = newPageUrl.includes('consent');
+        if (isConsentPage) {
+            console.log('Consent page detected - accepting...');
+            await new Promise(r => setTimeout(r, 3000));
+            
+            const consentBtn = await page.$('button[type="submit"]') ||
+                              await firstXPath(page, '//button[contains(text(), "Continue") or contains(text(), "Allow") or contains(text(), "Accept")]');
+            if (consentBtn) {
+                console.log('Clicking consent button...');
+                // Click and immediately start monitoring
+                await consentBtn.click();
+            }
+            
+            // Wait and monitor for redirect - check frequently
+            console.log('Waiting for redirect to localhost...');
+            for (let i = 0; i < 30; i++) {
+                await new Promise(r => setTimeout(r, 500));
+                
+                // Check if we captured the callback URL
+                if (callbackUrl) {
+                    console.log(`[SUCCESS] Callback URL captured: ${callbackUrl}`);
+                    break;
+                }
+                
+                // Also check current page URL
+                const currentUrl = page.url();
+                if (isCodexCallbackUrl(currentUrl)) {
+                    callbackUrl = currentUrl;
+                    console.log(`[SUCCESS] Callback URL from page: ${currentUrl}`);
+                    break;
+                } else if (currentUrl.includes('localhost:1455')) {
+                    localRedirectUrl = currentUrl;
+                }
+                
+                // Log progress
+                if (i % 10 === 0 && i > 0) {
+                    console.log(`  [${i}/30] Waiting... Last URL: ${lastUrl}`);
+                }
+            }
+            
+            await takeScreenshot(page, '08-consent-given');
+            newPageUrl = page.url();
+            console.log(`After consent - URL: ${newPageUrl}`);
+        }
+
+        // Some flows now require explicit org/project confirmation page before callback redirect.
+        if (newPageUrl.includes('/organization')) {
+            console.log('Organization selection page detected - clicking Continue...');
+            const clickedOrgContinue = await page.evaluate(() => {
+                const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                const btn = nodes.find((el) => /continue/i.test((el.textContent || '').trim()));
+                if (!btn) return false;
+                btn.click();
+                return true;
+            });
+            if (!clickedOrgContinue) {
+                await page.keyboard.press('Enter').catch(() => {});
+            }
+
+            console.log('Waiting for redirect after organization step...');
+            for (let i = 0; i < 30; i++) {
+                await new Promise(r => setTimeout(r, 500));
+                if (callbackUrl) {
+                    console.log(`[SUCCESS] Callback URL captured after organization step: ${callbackUrl}`);
+                    break;
+                }
+                const currentUrl = page.url();
+                if (isCodexCallbackUrl(currentUrl)) {
+                    callbackUrl = currentUrl;
+                    console.log(`[SUCCESS] Callback URL from page after organization step: ${currentUrl}`);
+                    break;
+                } else if (currentUrl.includes('localhost:1455')) {
+                    localRedirectUrl = currentUrl;
+                }
+            }
+            await takeScreenshot(page, '08e-organization-continued');
+            newPageUrl = page.url();
+            console.log(`After organization step - URL: ${newPageUrl}`);
+        }
+
+        // Wait for final redirect
+        console.log('Waiting for final redirect...');
+        await new Promise(r => setTimeout(r, 5000));
+        
+        const finalUrl = page.url();
+        console.log(`Final URL: ${finalUrl}`);
+        await takeScreenshot(page, '09-final');
+
+        // Get the callback URL
+        let resultUrl = null;
+        if (callbackUrl) {
+            resultUrl = callbackUrl;
+        } else if (isCodexCallbackUrl(finalUrl)) {
+            resultUrl = finalUrl;
+        }
+
+        // Clean up callback URL - remove any trailing text artifacts
+        if (resultUrl) {
+            resultUrl = resultUrl.replace(/Waiting.*$/, '').replace(/\s+$/, '');
+        }
+
+        console.log('');
+        console.log('========================================');
+        console.log('AUTHENTICATION COMPLETE');
+        console.log('========================================');
+        console.log(`Callback URL: ${resultUrl || '(not captured)'}`);
+        if (!resultUrl && localRedirectUrl) {
+            console.log(`Local redirect without code: ${localRedirectUrl}`);
+        }
+        console.log('');
+
+        if (resultUrl) {
+            // Output the callback URL for the shell script to capture
+            console.log(`CALLBACK:${resultUrl}`);
+            return { success: true, url: resultUrl };
+        }
+
+        return { success: false, reason: 'No callback URL with auth code captured' };
+    } catch (error) {
+        throw error;
+    } finally {
+        if (browser) {
+            await browser.close().catch(() => {});
+        }
+        if (anonymizedProxyUrl) {
+            await proxyChain.closeAnonymizedProxy(anonymizedProxyUrl, true).catch(() => {});
+        }
+    }
+}
+
+// Main execution
+async function main() {
+    const authUrl = process.argv[2];
+    if (!authUrl) {
+        console.error('Usage: node codex-login.js <auth-url>');
+        process.exit(1);
+    }
+
+    console.log('Starting automated login...');
+    const result = await performLogin(authUrl);
+    if (!result || !result.success) {
+        const reason = (result && result.reason) ? result.reason : 'unknown_error';
+        console.log(`RESULT_REASON:${reason}`);
+        process.exit(2);
+    }
+    console.log('RESULT_REASON:success');
+}
+
+main().catch(err => {
+    console.error('Error:', err.message);
+    console.error(err.stack);
+    const normalized = String(err && err.message ? err.message : 'unknown_error')
+        .replace(/\s+/g, '_')
+        .slice(0, 180);
+    console.log(`RESULT_REASON:exception:${normalized}`);
+    process.exit(1);
+});

@@ -53,7 +53,7 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
 	return &CodexAuth{
-		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
+		httpClient: util.SetProxy(&sdkCfg, &http.Client{Timeout: 90 * time.Second}),
 	}
 }
 
@@ -117,21 +117,35 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
+	startedAt := time.Now()
+	fmt.Printf("[codex-auth-debug] token HTTP POST start: url=%s redirect=%s code_len=%d verifier_len=%d timeout=%s\n",
+		TokenURL,
+		strings.TrimSpace(redirectURI),
+		len(strings.TrimSpace(code)),
+		len(strings.TrimSpace(pkceCodes.CodeVerifier)),
+		o.httpClient.Timeout,
+	)
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		fmt.Printf("[codex-auth-debug] token HTTP POST failed after %s: %v\n", time.Since(startedAt).Round(time.Millisecond), err)
 		return nil, fmt.Errorf("token exchange request failed: %w", err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
+	fmt.Printf("[codex-auth-debug] token HTTP response received after %s: status=%d\n", time.Since(startedAt).Round(time.Millisecond), resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
-	// log.Debugf("Token response: %s", string(body))
 
 	if resp.StatusCode != http.StatusOK {
+		bodyPreview := strings.TrimSpace(string(body))
+		if len(bodyPreview) > 240 {
+			bodyPreview = bodyPreview[:240] + "..."
+		}
+		fmt.Printf("[codex-auth-debug] token exchange non-200 body=%q\n", bodyPreview)
 		return nil, fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -147,6 +161,12 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
+	fmt.Printf("[codex-auth-debug] token JSON parsed: access=%t refresh=%t id=%t expires_in=%d\n",
+		strings.TrimSpace(tokenResp.AccessToken) != "",
+		strings.TrimSpace(tokenResp.RefreshToken) != "",
+		strings.TrimSpace(tokenResp.IDToken) != "",
+		tokenResp.ExpiresIn,
+	)
 
 	// Extract account ID from ID token
 	claims, err := ParseJWTToken(tokenResp.IDToken)
@@ -160,6 +180,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		accountID = claims.GetAccountID()
 		email = claims.GetUserEmail()
 	}
+	fmt.Printf("[codex-auth-debug] token claims parsed: email=%q account_id_present=%t\n", email, strings.TrimSpace(accountID) != "")
 
 	// Create token data
 	tokenData := CodexTokenData{

@@ -50,15 +50,29 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s not registered", provider)
 	}
 
+	isCodex := provider == "codex"
+	if isCodex {
+		fmt.Println("[codex-auth-debug] manager login start")
+	}
+
 	record, err := auth.Login(ctx, cfg, opts)
 	if err != nil {
+		if isCodex {
+			fmt.Printf("[codex-auth-debug] manager login failed before save: %v\n", err)
+		}
 		return nil, "", err
 	}
 	if record == nil {
 		return nil, "", fmt.Errorf("cliproxy auth: authenticator %s returned nil record", provider)
 	}
+	if isCodex {
+		fmt.Printf("[codex-auth-debug] manager received auth record: id=%q file=%q provider=%q\n", record.ID, record.FileName, record.Provider)
+	}
 
 	if m.store == nil {
+		if isCodex {
+			fmt.Println("[codex-auth-debug] manager store is nil, skipping save")
+		}
 		return record, "", nil
 	}
 
@@ -67,10 +81,23 @@ func (m *Manager) Login(ctx context.Context, provider string, cfg *config.Config
 			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
 	}
+	if isCodex {
+		authDir := ""
+		if cfg != nil {
+			authDir = cfg.AuthDir
+		}
+		fmt.Printf("[codex-auth-debug] manager saving auth record to auth_dir=%q\n", authDir)
+	}
 
 	savedPath, err := m.store.Save(ctx, record)
 	if err != nil {
+		if isCodex {
+			fmt.Printf("[codex-auth-debug] manager save failed: %v\n", err)
+		}
 		return record, "", err
+	}
+	if isCodex {
+		fmt.Printf("[codex-auth-debug] manager save completed: %q\n", savedPath)
 	}
 	return record, savedPath, nil
 }
