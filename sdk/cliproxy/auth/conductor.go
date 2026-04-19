@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,11 @@ const (
 )
 
 var quotaCooldownDisabled atomic.Bool
+
+var (
+	retryAfterTextPattern  = regexp.MustCompile(`(?i)(?:retry(?:\s*[-_]?after)?|try again(?:\s+in)?|cooldown|reset(?:\s+after|\s+in)?|available(?:\s+in)?|wait(?:\s+for)?)\D{0,24}(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b`)
+	retryAfterPlainPattern = regexp.MustCompile(`(?i)(?:retry(?:\s*[-_]?after)?|cooldown|reset(?:\s+after|\s+in)?|wait(?:\s+for)?)\D{0,8}(\d+(?:\.\d+)?)\b`)
+)
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -824,11 +830,8 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
-				rerr := &Error{Message: chunk.Err.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				rerr := resultErrorFromExecution(chunk.Err)
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RetryAfter: retryAfterFromError(chunk.Err)})
 			}
 			if !forward {
 				return false
@@ -879,10 +882,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromExecution(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
@@ -900,10 +900,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromExecution(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -911,10 +908,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromExecution(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -922,10 +916,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = bootstrapErr
 				continue
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromExecution(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
@@ -1396,10 +1387,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromExecution(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -1495,10 +1483,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromExecution(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
@@ -2308,28 +2293,76 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						auth.StatusMessage = result.Error.Message
 					}
 
+					derivedRetryAfter := normalizeRetryAfterHint(result.Error, result.RetryAfter)
 					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
+					setQuotaState := func() {
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						if disableCooling {
+							next = time.Time{}
+						} else if derivedRetryAfter != nil {
+							next = now.Add(*derivedRetryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
+						}
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						if !disableCooling {
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						}
+					}
+
+					switch {
+					case isPermanentAccountBlockResultError(result.Error):
+						state.Status = StatusDisabled
+						state.Unavailable = true
+						state.NextRetryAfter = time.Time{}
+						state.Quota = QuotaState{}
+						state.StatusMessage = "account_blocked"
+						disableAuthForProviderBlock(auth, now, result.Error)
+						suspendReason = "account_blocked"
+						shouldSuspendModel = true
+						clearModelQuota = true
+					case isModelSupportResultError(result.Error):
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
-					} else {
+					default:
 						switch statusCode {
 						case 401:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(30 * time.Minute)
+								if derivedRetryAfter != nil {
+									next = now.Add(*derivedRetryAfter)
+								}
 								state.NextRetryAfter = next
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
 							}
 						case 402, 403:
-							if disableCooling {
+							if isQuotaResultError(result.Error) {
+								setQuotaState()
+							} else if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(30 * time.Minute)
+								if derivedRetryAfter != nil {
+									next = now.Add(*derivedRetryAfter)
+								}
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -2344,31 +2377,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 429:
-							var next time.Time
-							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
-								} else {
-									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-									if cooldown > 0 {
-										next = now.Add(cooldown)
-									}
-									backoffLevel = nextLevel
-								}
-							}
-							state.NextRetryAfter = next
-							state.Quota = QuotaState{
-								Exceeded:      true,
-								Reason:        "quota",
-								NextRecoverAt: next,
-								BackoffLevel:  backoffLevel,
-							}
-							if !disableCooling {
-								suspendReason = "quota"
-								shouldSuspendModel = true
-								setModelQuota = true
-							}
+							setQuotaState()
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
@@ -2377,16 +2386,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 							}
 						default:
-							state.NextRetryAfter = time.Time{}
+							if isQuotaResultError(result.Error) {
+								setQuotaState()
+							} else if derivedRetryAfter != nil {
+								state.NextRetryAfter = now.Add(*derivedRetryAfter)
+								suspendReason = "cooldown"
+								shouldSuspendModel = true
+							} else {
+								state.NextRetryAfter = time.Time{}
+							}
 						}
 					}
 
-					auth.Status = StatusError
+					if !auth.Disabled {
+						auth.Status = StatusError
+					}
 					auth.UpdatedAt = now
 					updateAggregatedAvailability(auth, now)
 				}
 			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				applyAuthFailureState(auth, result.Error, normalizeRetryAfterHint(result.Error, result.RetryAfter), now)
 			}
 		}
 
@@ -2592,6 +2611,345 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+func cloneDurationPtr(d *time.Duration) *time.Duration {
+	if d == nil {
+		return nil
+	}
+	return new(*d)
+}
+
+func resultErrorFromExecution(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	var coreErr *Error
+	if errors.As(err, &coreErr) && coreErr != nil {
+		cloned := cloneError(coreErr)
+		if cloned.Message == "" {
+			cloned.Message = err.Error()
+		}
+		if cloned.HTTPStatus == 0 {
+			cloned.HTTPStatus = statusCodeFromError(err)
+		}
+		return cloned
+	}
+	return &Error{
+		Message:    err.Error(),
+		HTTPStatus: statusCodeFromError(err),
+	}
+}
+
+func normalizeProviderErrorText(message string) string {
+	if message == "" {
+		return ""
+	}
+	replacer := strings.NewReplacer(
+		"_", " ",
+		"-", " ",
+		"\n", " ",
+		"\r", " ",
+		"\t", " ",
+		`"`, " ",
+		"'", " ",
+		"`", " ",
+	)
+	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(message))), " ")
+}
+
+func containsAnyProviderToken(normalized string, tokens []string) bool {
+	if normalized == "" {
+		return false
+	}
+	for _, token := range tokens {
+		if token != "" && strings.Contains(normalized, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPermanentAccountBlockResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	normalized := normalizeProviderErrorText(err.Message)
+	if normalized == "" {
+		return false
+	}
+	strongBlockMarkers := []string{
+		"account blocked",
+		"account is blocked",
+		"has been blocked due to unauthorized requests",
+		"blocked due to unauthorized requests",
+		"account suspended",
+		"account is suspended",
+		"account banned",
+		"account disabled",
+		"account is disabled",
+		"account deactivated",
+		"account is deactivated",
+		"policy violation",
+		"access revoked",
+		"token revoked",
+		"refresh token revoked",
+	}
+	if containsAnyProviderToken(normalized, strongBlockMarkers) {
+		return true
+	}
+
+	status := statusCodeFromResult(err)
+	if status != http.StatusUnauthorized && status != http.StatusForbidden {
+		return false
+	}
+	credentialBlockMarkers := []string{
+		"invalid api key",
+		"incorrect api key",
+		"api key revoked",
+		"api key has been revoked",
+		"api key disabled",
+		"api key has been disabled",
+	}
+	return containsAnyProviderToken(normalized, credentialBlockMarkers)
+}
+
+func isQuotaResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if statusCodeFromResult(err) == http.StatusTooManyRequests {
+		return true
+	}
+	normalized := normalizeProviderErrorText(err.Message)
+	if normalized == "" {
+		return false
+	}
+	quotaMarkers := []string{
+		"insufficient quota",
+		"quota exceeded",
+		"quota exhausted",
+		"rate limit",
+		"too many requests",
+		"resource exhausted",
+	}
+	return containsAnyProviderToken(normalized, quotaMarkers)
+}
+
+func normalizeRetryAfterHint(err *Error, retryAfter *time.Duration) *time.Duration {
+	if retryAfter != nil && *retryAfter > 0 {
+		return cloneDurationPtr(retryAfter)
+	}
+	if err == nil {
+		return nil
+	}
+	return parseRetryAfterFromProviderMessage(err.Message)
+}
+
+func parseRetryAfterFromProviderMessage(message string) *time.Duration {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
+	now := time.Now()
+	if retryAfter := parseRetryAfterFromJSONPayload(message, now); retryAfter != nil {
+		return retryAfter
+	}
+	return parseRetryAfterFromTextPayload(message)
+}
+
+func parseRetryAfterFromJSONPayload(message string, now time.Time) *time.Duration {
+	var payload any
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return nil
+	}
+	duration, ok := extractRetryAfterDuration(payload, now)
+	if !ok || duration <= 0 {
+		return nil
+	}
+	return &duration
+}
+
+func extractRetryAfterDuration(value any, now time.Time) (time.Duration, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			normKey := normalizeRetryAfterKey(key)
+			if duration, ok := parseRetryAfterValue(normKey, nested, now); ok {
+				return duration, true
+			}
+			if duration, ok := extractRetryAfterDuration(nested, now); ok {
+				return duration, true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if duration, ok := extractRetryAfterDuration(nested, now); ok {
+				return duration, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func normalizeRetryAfterKey(key string) string {
+	key = strings.TrimSpace(strings.ToLower(key))
+	if key == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(key))
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			builder.WriteByte(c)
+		}
+	}
+	return builder.String()
+}
+
+func parseRetryAfterValue(normalizedKey string, value any, now time.Time) (time.Duration, bool) {
+	if normalizedKey == "" {
+		return 0, false
+	}
+	knownKey := strings.Contains(normalizedKey, "retryafter") ||
+		strings.Contains(normalizedKey, "retryin") ||
+		strings.Contains(normalizedKey, "cooldown") ||
+		strings.Contains(normalizedKey, "resetin") ||
+		strings.Contains(normalizedKey, "resetafter") ||
+		strings.Contains(normalizedKey, "resettime") ||
+		strings.Contains(normalizedKey, "wait")
+	if !knownKey {
+		return 0, false
+	}
+
+	multiplier := time.Second
+	if strings.Contains(normalizedKey, "millisecond") || strings.HasSuffix(normalizedKey, "ms") {
+		multiplier = time.Millisecond
+	}
+
+	parseNumeric := func(raw float64) (time.Duration, bool) {
+		if raw <= 0 {
+			return 0, false
+		}
+		return time.Duration(raw * float64(multiplier)), true
+	}
+
+	switch typed := value.(type) {
+	case float64:
+		return parseNumeric(typed)
+	case float32:
+		return parseNumeric(float64(typed))
+	case int:
+		return parseNumeric(float64(typed))
+	case int32:
+		return parseNumeric(float64(typed))
+	case int64:
+		return parseNumeric(float64(typed))
+	case uint:
+		return parseNumeric(float64(typed))
+	case uint32:
+		return parseNumeric(float64(typed))
+	case uint64:
+		return parseNumeric(float64(typed))
+	case json.Number:
+		if f, err := typed.Float64(); err == nil {
+			return parseNumeric(f)
+		}
+	case string:
+		raw := strings.TrimSpace(typed)
+		if raw == "" {
+			return 0, false
+		}
+		if ts, ok := parseTimeValue(raw); ok && ts.After(now) {
+			return ts.Sub(now), true
+		}
+		if duration := parseDurationString(raw); duration > 0 {
+			return duration, true
+		}
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return parseNumeric(f)
+		}
+	}
+	return 0, false
+}
+
+func parseRetryAfterFromTextPayload(message string) *time.Duration {
+	parseNumber := func(raw string) float64 {
+		value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil || value <= 0 {
+			return 0
+		}
+		return value
+	}
+	parseUnit := func(raw string) time.Duration {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "ms", "millisecond", "milliseconds":
+			return time.Millisecond
+		case "s", "sec", "secs", "second", "seconds":
+			return time.Second
+		case "m", "min", "mins", "minute", "minutes":
+			return time.Minute
+		case "h", "hr", "hrs", "hour", "hours":
+			return time.Hour
+		default:
+			return 0
+		}
+	}
+
+	matches := retryAfterTextPattern.FindStringSubmatch(message)
+	if len(matches) == 3 {
+		value := parseNumber(matches[1])
+		unit := parseUnit(matches[2])
+		if value > 0 && unit > 0 {
+			duration := time.Duration(value * float64(unit))
+			if duration > 0 {
+				return &duration
+			}
+		}
+	}
+
+	matches = retryAfterPlainPattern.FindStringSubmatch(message)
+	if len(matches) == 2 {
+		value := parseNumber(matches[1])
+		if value > 0 {
+			duration := time.Duration(value * float64(time.Second))
+			if duration > 0 {
+				return &duration
+			}
+		}
+	}
+	return nil
+}
+
+func disableAuthForProviderBlock(auth *Auth, now time.Time, resultErr *Error) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = true
+	auth.Unavailable = true
+	auth.Status = StatusDisabled
+	auth.StatusMessage = "account_blocked"
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.UpdatedAt = now
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		state.Status = StatusDisabled
+		state.Unavailable = true
+		state.NextRetryAfter = time.Time{}
+		state.Quota = QuotaState{}
+		state.UpdatedAt = now
+		state.StatusMessage = "account_blocked"
+		if resultErr != nil {
+			state.LastError = cloneError(resultErr)
+		}
+	}
+}
+
 func statusCodeFromError(err error) int {
 	if err == nil {
 		return 0
@@ -2771,6 +3129,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		return
 	}
 	disableCooling := quotaCooldownDisabledForAuth(auth)
+	if isPermanentAccountBlockResultError(resultErr) {
+		disableAuthForProviderBlock(auth, now, resultErr)
+		return
+	}
+
+	derivedRetryAfter := normalizeRetryAfterHint(resultErr, retryAfter)
 	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
@@ -2788,13 +3152,39 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			if derivedRetryAfter != nil {
+				auth.NextRetryAfter = now.Add(*derivedRetryAfter)
+			}
 		}
 	case 402, 403:
-		auth.StatusMessage = "payment_required"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
+		if isQuotaResultError(resultErr) {
+			auth.StatusMessage = "quota exhausted"
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "quota"
+			var next time.Time
+			if disableCooling {
+				next = time.Time{}
+			} else if derivedRetryAfter != nil {
+				next = now.Add(*derivedRetryAfter)
+			} else {
+				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				if cooldown > 0 {
+					next = now.Add(cooldown)
+				}
+				auth.Quota.BackoffLevel = nextLevel
+			}
+			auth.Quota.NextRecoverAt = next
+			auth.NextRetryAfter = next
 		} else {
-			auth.NextRetryAfter = now.Add(30 * time.Minute)
+			auth.StatusMessage = "payment_required"
+			if disableCooling {
+				auth.NextRetryAfter = time.Time{}
+			} else {
+				auth.NextRetryAfter = now.Add(30 * time.Minute)
+				if derivedRetryAfter != nil {
+					auth.NextRetryAfter = now.Add(*derivedRetryAfter)
+				}
+			}
 		}
 	case 404:
 		auth.StatusMessage = "not_found"
@@ -2808,16 +3198,16 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
-		if !disableCooling {
-			if retryAfter != nil {
-				next = now.Add(*retryAfter)
-			} else {
-				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
-				if cooldown > 0 {
-					next = now.Add(cooldown)
-				}
-				auth.Quota.BackoffLevel = nextLevel
+		if disableCooling {
+			next = time.Time{}
+		} else if derivedRetryAfter != nil {
+			next = now.Add(*derivedRetryAfter)
+		} else {
+			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+			if cooldown > 0 {
+				next = now.Add(cooldown)
 			}
+			auth.Quota.BackoffLevel = nextLevel
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
@@ -2829,6 +3219,38 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(1 * time.Minute)
 		}
 	default:
+		if isQuotaResultError(resultErr) {
+			auth.StatusMessage = "quota exhausted"
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "quota"
+			var next time.Time
+			if disableCooling {
+				next = time.Time{}
+			} else if derivedRetryAfter != nil {
+				next = now.Add(*derivedRetryAfter)
+			} else {
+				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				if cooldown > 0 {
+					next = now.Add(cooldown)
+				}
+				auth.Quota.BackoffLevel = nextLevel
+			}
+			auth.Quota.NextRecoverAt = next
+			auth.NextRetryAfter = next
+			return
+		}
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+			if auth.StatusMessage == "" {
+				auth.StatusMessage = "request failed"
+			}
+			return
+		}
+		if derivedRetryAfter != nil {
+			auth.StatusMessage = "cooldown"
+			auth.NextRetryAfter = now.Add(*derivedRetryAfter)
+			return
+		}
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}

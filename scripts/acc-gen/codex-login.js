@@ -3,7 +3,7 @@ const proxyChain = require('proxy-chain');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 
 // Load accounts from accounts.json (or override via CODEX_ACCOUNTS_FILE)
 const ACCOUNTS_FILE = process.env.CODEX_ACCOUNTS_FILE
@@ -52,14 +52,22 @@ const HERO_SMS_SERVICES = String(process.env.HERO_SMS_SERVICES || '')
     .filter(Boolean);
 const HERO_SMS_SERVICE_PREFIX = String(process.env.HERO_SMS_SERVICE_PREFIX || '').trim().toLowerCase();
 const HERO_SMS_SERVICE_QUERY = String(process.env.HERO_SMS_SERVICE_QUERY || 'open').trim().toLowerCase();
-const HERO_SMS_PRICE_RANKING = String(process.env.HERO_SMS_PRICE_RANKING || 'price_asc').trim().toLowerCase();
-const HERO_SMS_COUNTRIES = String(process.env.HERO_SMS_COUNTRIES || '52,16,6,4,7,13,2,1')
+const HERO_SMS_PRICE_RANKING = String(process.env.HERO_SMS_PRICE_RANKING || 'off').trim().toLowerCase();
+const HERO_SMS_COUNTRIES = String(process.env.HERO_SMS_COUNTRIES || '52,151,15,46,32')
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean);
-const HERO_SMS_POLL_TIMEOUT_SEC = Math.max(30, parseInt(process.env.HERO_SMS_POLL_TIMEOUT_SEC || '180', 10) || 180);
+const HERO_SMS_POLL_TIMEOUT_SEC = Math.max(30, parseInt(process.env.HERO_SMS_POLL_TIMEOUT_SEC || '30', 10) || 30);
 const HERO_SMS_POLL_INTERVAL_MS = Math.max(2000, parseInt(process.env.HERO_SMS_POLL_INTERVAL_MS || '3000', 10) || 3000);
+const HERO_SMS_MAX_COUNTRY_ATTEMPTS = Math.max(1, parseInt(process.env.HERO_SMS_MAX_COUNTRY_ATTEMPTS || '5', 10) || 5);
+const HERO_SMS_CANCEL_RETRY_DELAY_SEC = Math.max(30, parseInt(process.env.HERO_SMS_CANCEL_RETRY_DELAY_SEC || '180', 10) || 180);
 const HERO_SMS_API_KEY = String(process.env.HERO_SMS_API_KEY || '').trim();
+const SCREENSHOT_MODE = String(process.env.CODEX_SCREENSHOTS || 'off').trim().toLowerCase();
+const ENABLE_SCREENSHOTS = SCREENSHOT_MODE === '1' || SCREENSHOT_MODE === 'true' || SCREENSHOT_MODE === 'all';
+const AUTH_PAGE_NAV_TIMEOUT_MS = Math.max(15000, parseInt(process.env.CODEX_AUTH_PAGE_NAV_TIMEOUT_MS || '35000', 10) || 35000);
+const AUTH_PAGE_NAV_RETRIES = Math.max(1, parseInt(process.env.CODEX_AUTH_PAGE_NAV_RETRIES || '2', 10) || 2);
+const EMAIL_INPUT_TIMEOUT_MS = Math.max(4000, parseInt(process.env.CODEX_EMAIL_INPUT_TIMEOUT_MS || '7000', 10) || 7000);
+const BLANK_PAGE_SETTLE_MS = Math.max(1000, parseInt(process.env.CODEX_BLANK_PAGE_SETTLE_MS || '2000', 10) || 2000);
 const PUPPETEER_CHROME_CANDIDATES = [
     process.env.PUPPETEER_EXECUTABLE_PATH,
     process.env.CHROME_BIN,
@@ -71,6 +79,10 @@ const PUPPETEER_CHROME_CANDIDATES = [
 ].filter(Boolean);
 let heroSmsServiceCandidatesCache = null;
 const heroSmsPricesByCountryCache = new Map();
+let activeBrowser = null;
+let activeAnonymizedProxyUrl = null;
+let cleanupPromise = null;
+let signalHandlersInstalled = false;
 
 function optionalRequire(modName) {
     try {
@@ -285,6 +297,209 @@ async function firstXPath(page, xpath) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function heroSmsNeedsDelayedCancel(responseText) {
+    const text = String(responseText || '').trim();
+    return /EARLY_CANCEL_DENIED|cannot be cancelled at this time|hero_sms_http_409/i.test(text);
+}
+
+function scheduleHeroSmsCancelRetry(activationId) {
+    const id = String(activationId || '').trim();
+    if (!id || !HERO_SMS_API_KEY) {
+        return;
+    }
+
+    const safeDelay = HERO_SMS_CANCEL_RETRY_DELAY_SEC;
+    const safeBase = JSON.stringify(HERO_SMS_BASE_URL);
+    const safeApiKey = JSON.stringify(HERO_SMS_API_KEY);
+    const safeID = JSON.stringify(id);
+    const helperSource = [
+        'const https = require("https");',
+        `const base = ${safeBase};`,
+        `const apiKey = ${safeApiKey};`,
+        `const id = ${safeID};`,
+        'const u = new URL(base);',
+        'u.searchParams.set("action", "setStatus");',
+        'u.searchParams.set("api_key", apiKey);',
+        'u.searchParams.set("id", id);',
+        'u.searchParams.set("status", "8");',
+        'https.get(u, (res) => {',
+        '  let body = "";',
+        '  res.on("data", (c) => { body += c.toString(); });',
+        '  res.on("end", () => {',
+        '    console.log(`[Hero-SMS delayed cancel] id=${id} status=${res.statusCode} body=${body.trim()}`);',
+        '  });',
+        '}).on("error", (e) => {',
+        '  console.log(`[Hero-SMS delayed cancel] id=${id} error=${e.message}`);',
+        '});'
+    ].join('\n');
+
+    const shellSource = `sleep ${safeDelay}; node -e ${JSON.stringify(helperSource)}`;
+    const child = spawn('bash', ['-lc', shellSource], {
+        detached: true,
+        stdio: 'ignore'
+    });
+    child.unref();
+    console.log(`Hero-SMS delayed cancel scheduled: id=${id}, delay=${safeDelay}s`);
+}
+
+function shouldBlockRequest(resourceType, url) {
+    const type = String(resourceType || '').toLowerCase();
+    const rawUrl = String(url || '');
+
+    if (!rawUrl || rawUrl.includes('localhost:1455')) {
+        return false;
+    }
+
+    if (type === 'image' || type === 'media' || type === 'font') {
+        return true;
+    }
+
+    return /google-analytics|googletagmanager|doubleclick|segment\.io|sentry|intercom|hotjar/i.test(rawUrl);
+}
+
+async function enableLeanPageRequests(page, engine) {
+    if (!page) {
+        return;
+    }
+
+    if (engine === 'puppeteer' && typeof page.setRequestInterception === 'function') {
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+            if (shouldBlockRequest(request.resourceType(), request.url())) {
+                request.abort().catch(() => {});
+                return;
+            }
+            request.continue().catch(() => {});
+        });
+        return;
+    }
+
+    if (typeof page.route === 'function') {
+        await page.route('**/*', async (route) => {
+            const request = route.request();
+            if (shouldBlockRequest(request.resourceType(), request.url())) {
+                await route.abort().catch(() => {});
+                return;
+            }
+            await route.continue().catch(() => {});
+        });
+    }
+}
+
+async function collectPageSnapshot(page) {
+    try {
+        return await page.evaluate(() => {
+            const body = document.body;
+            const text = body && typeof body.innerText === 'string' ? body.innerText.trim() : '';
+            return {
+                title: document.title || '',
+                readyState: document.readyState || '',
+                url: location.href || '',
+                htmlLength: document.documentElement ? document.documentElement.outerHTML.length : 0,
+                textLength: text.length,
+                nodeCount: body ? body.querySelectorAll('*').length : 0,
+                emailInputs: document.querySelectorAll('input[type="email"], input[name="email"]').length
+            };
+        });
+    } catch (error) {
+        return {
+            title: '',
+            readyState: '',
+            url: '',
+            htmlLength: 0,
+            textLength: 0,
+            nodeCount: 0,
+            emailInputs: 0,
+            error: String((error && error.message) || error || 'snapshot_failed')
+        };
+    }
+}
+
+function isProbablyBlankLoginPage(snapshot) {
+    if (!snapshot) {
+        return false;
+    }
+
+    if ((snapshot.emailInputs || 0) > 0) {
+        return false;
+    }
+
+    return (snapshot.textLength || 0) === 0 && (snapshot.nodeCount || 0) < 3 && (snapshot.htmlLength || 0) < 1200;
+}
+
+async function closeBrowserHard(browser) {
+    if (!browser) {
+        return;
+    }
+
+    const browserProcess = typeof browser.process === 'function' ? browser.process() : null;
+    await browser.close().catch(() => {});
+
+    if (!browserProcess || !browserProcess.pid) {
+        return;
+    }
+
+    try {
+        process.kill(browserProcess.pid, 0);
+    } catch (_) {
+        return;
+    }
+
+    try {
+        process.kill(browserProcess.pid, 'SIGTERM');
+    } catch (_) {
+        return;
+    }
+
+    await sleep(400);
+    try {
+        process.kill(browserProcess.pid, 0);
+        process.kill(browserProcess.pid, 'SIGKILL');
+    } catch (_) {
+        // Browser already exited.
+    }
+}
+
+async function cleanupActiveResources() {
+    if (cleanupPromise) {
+        return cleanupPromise;
+    }
+
+    cleanupPromise = (async () => {
+        const browser = activeBrowser;
+        const proxyUrl = activeAnonymizedProxyUrl;
+        activeBrowser = null;
+        activeAnonymizedProxyUrl = null;
+
+        if (browser) {
+            await closeBrowserHard(browser).catch(() => {});
+        }
+        if (proxyUrl) {
+            await proxyChain.closeAnonymizedProxy(proxyUrl, true).catch(() => {});
+        }
+    })();
+
+    try {
+        await cleanupPromise;
+    } finally {
+        cleanupPromise = null;
+    }
+}
+
+function installSignalHandlers() {
+    if (signalHandlersInstalled) {
+        return;
+    }
+
+    signalHandlersInstalled = true;
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+        process.once(signal, () => {
+            cleanupActiveResources()
+                .finally(() => process.exit(0));
+        });
+    }
 }
 
 function heroSmsErrorText(raw) {
@@ -544,6 +759,18 @@ async function heroSmsBuildAcquirePlan(countries, services) {
     return withPrice;
 }
 
+function heroSmsBuildCountryRetryPlan(acquirePlan) {
+    const seen = new Set();
+    const plan = [];
+    for (const candidate of acquirePlan || []) {
+        const country = String(candidate && candidate.country || '').trim();
+        if (!country || seen.has(country)) continue;
+        seen.add(country);
+        plan.push(candidate);
+    }
+    return plan;
+}
+
 function heroSmsRequest(params, timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
         const url = new URL(HERO_SMS_BASE_URL);
@@ -588,15 +815,9 @@ async function heroSmsSetStatus(activationId, status) {
     }
 }
 
-async function heroSmsAcquireActivation() {
-    if (!HERO_SMS_API_KEY) {
-        throw new Error('hero_sms_api_key_missing');
-    }
-
-    const serviceCandidates = await heroSmsResolveServiceCandidates();
-    const acquirePlan = await heroSmsBuildAcquirePlan(HERO_SMS_COUNTRIES, serviceCandidates);
+async function heroSmsAcquireActivationFromPlan(acquirePlan) {
     let lastReason = 'no_attempts';
-    for (const candidate of acquirePlan) {
+    for (const candidate of (acquirePlan || [])) {
         const country = candidate.country;
         const service = candidate.service;
         const raw = await heroSmsRequest({
@@ -620,6 +841,15 @@ async function heroSmsAcquireActivation() {
     }
 
     throw new Error(`hero_sms_get_number_failed:${lastReason}`);
+}
+
+async function heroSmsAcquireActivation() {
+    if (!HERO_SMS_API_KEY) {
+        throw new Error('hero_sms_api_key_missing');
+    }
+    const serviceCandidates = await heroSmsResolveServiceCandidates();
+    const acquirePlan = await heroSmsBuildAcquirePlan(HERO_SMS_COUNTRIES, serviceCandidates);
+    return heroSmsAcquireActivationFromPlan(acquirePlan);
 }
 
 async function heroSmsWaitForCode(activationId) {
@@ -695,95 +925,161 @@ async function completePhoneVerificationWithHeroSMS(page) {
         return { success: false, reason: 'phone_required_hero_sms_api_key_missing' };
     }
 
-    let activation = null;
-    try {
-        activation = await heroSmsAcquireActivation();
-        if (activation && activation.id) {
-            const statusResp = await heroSmsSetStatus(activation.id, 1);
-            console.log(`Hero-SMS setStatus(1): ${statusResp}`);
+    const serviceCandidates = await heroSmsResolveServiceCandidates();
+    const acquirePlan = await heroSmsBuildAcquirePlan(HERO_SMS_COUNTRIES, serviceCandidates);
+    const countryRetryPlan = heroSmsBuildCountryRetryPlan(acquirePlan).slice(0, HERO_SMS_MAX_COUNTRY_ATTEMPTS);
+    if (countryRetryPlan.length === 0) {
+        return { success: false, reason: 'phone_required:hero_sms_no_country_plan' };
+    }
+    console.log(`Hero-SMS country attempts: ${countryRetryPlan.map((x) => x.country).join(', ')} (max=${HERO_SMS_MAX_COUNTRY_ATTEMPTS})`);
+
+    await takeScreenshot(page, '08d-phone-required');
+    let lastReason = 'hero_sms_no_attempts';
+    const phoneInputSelectors = [
+        'input[type="tel"]',
+        'input[autocomplete="tel"]',
+        'input[name*="phone" i]',
+        'input[aria-label*="phone" i]',
+        'input[inputmode="tel"]'
+    ];
+    const codeInputSelectors = [
+        'input[autocomplete="one-time-code"]',
+        'input[name*="code" i]',
+        'input[placeholder*="code" i]',
+        'input[inputmode="numeric"][maxlength="6"]',
+        'input[maxlength="6"]'
+    ];
+
+    async function ensurePhoneInputVisible() {
+        let phoneInputResult = await waitForAnySelector(page, phoneInputSelectors, 6000);
+        if (phoneInputResult && phoneInputResult.handle) return phoneInputResult;
+
+        const codeInputResult = await waitForAnySelector(page, codeInputSelectors, 2000);
+        if (codeInputResult && codeInputResult.handle) {
+            // When we're stuck on "enter code", force-switch back to "enter phone".
+            await clickButtonByText(page, /(change|different|another|edit|other number|use another|back|друг|измен|назад|сменить)/i).catch(() => {});
+            await sleep(1200);
         }
 
-        await takeScreenshot(page, '08d-phone-required');
+        for (let i = 0; i < 3; i++) {
+            phoneInputResult = await waitForAnySelector(page, phoneInputSelectors, 3000);
+            if (phoneInputResult && phoneInputResult.handle) return phoneInputResult;
 
-        const phoneInputResult = await waitForAnySelector(page, [
-            'input[type="tel"]',
-            'input[autocomplete="tel"]',
-            'input[name*="phone" i]',
-            'input[aria-label*="phone" i]',
-            'input[inputmode="tel"]'
-        ], 15000);
-
-        if (!phoneInputResult || !phoneInputResult.handle) {
-            throw new Error('phone_input_not_found');
+            await clickButtonByText(page, /(change|different|another|edit|other number|use another|back|друг|измен|назад|сменить)/i).catch(() => {});
+            await sleep(1000);
         }
 
-        const candidates = [`+${activation.phone}`, activation.phone];
-        let codeInputResult = null;
-        for (const phoneCandidate of candidates) {
-            console.log(`Trying phone candidate: ${phoneCandidate}`);
-            await fillInputValue(page, phoneInputResult.handle, phoneCandidate);
-            await sleep(400);
+        // Last resort: open phone step directly.
+        await page.goto('https://auth.openai.com/add-phone', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        await sleep(1200);
+        return await waitForAnySelector(page, phoneInputSelectors, 6000);
+    }
 
-            const sent = await clickButtonByText(page, /(send|sms|code|continue|next|verify|получ|отправ|код)/i);
-            if (!sent) {
-                const submit = await page.$('button[type="submit"], input[type="submit"]').catch(() => null);
-                if (submit) {
-                    await submit.click().catch(() => {});
+    for (let countryAttempt = 0; countryAttempt < countryRetryPlan.length; countryAttempt++) {
+        const countryCandidate = countryRetryPlan[countryAttempt];
+        const country = countryCandidate.country;
+        const countryPlan = acquirePlan.filter((x) => x.country === country);
+        let activation = null;
+
+        try {
+            console.log(`Hero-SMS country attempt ${countryAttempt + 1}/${countryRetryPlan.length}: country=${country}, best_price=${countryCandidate.hasPrice ? countryCandidate.cost : 'n/a'}`);
+            activation = await heroSmsAcquireActivationFromPlan(countryPlan);
+            if (activation && activation.id) {
+                const statusResp = await heroSmsSetStatus(activation.id, 1);
+                console.log(`Hero-SMS setStatus(1): ${statusResp}`);
+            }
+
+            const phoneInputResult = await ensurePhoneInputVisible();
+            if (!phoneInputResult || !phoneInputResult.handle) {
+                throw new Error('phone_input_not_found');
+            }
+
+            const phoneCandidates = [`+${activation.phone}`, activation.phone];
+            let codeInputResult = null;
+            for (const phoneCandidate of phoneCandidates) {
+                console.log(`Trying phone candidate: ${phoneCandidate}`);
+                await fillInputValue(page, phoneInputResult.handle, phoneCandidate);
+                await sleep(400);
+
+                // Prefer explicit send/resend controls first.
+                let sent = await clickButtonByText(page, /(send code|resend|send again|get code|sms code|send sms|отправ|повтор|код)/i);
+                if (!sent) {
+                    sent = await clickButtonByText(page, /(send|sms|code|continue|next|verify|получ|отправ|код)/i);
+                }
+                if (!sent) {
+                    const submit = await page.$('button[type="submit"], input[type="submit"]').catch(() => null);
+                    if (submit) {
+                        await submit.click().catch(() => {});
+                    }
+                }
+
+                codeInputResult = await waitForAnySelector(page, codeInputSelectors, 10000);
+
+                if (codeInputResult) break;
+            }
+
+            if (!codeInputResult || !codeInputResult.handle) {
+                throw new Error('sms_code_input_not_found');
+            }
+
+            console.log(`Waiting for Hero-SMS code (timeout=${HERO_SMS_POLL_TIMEOUT_SEC}s)...`);
+            const smsCode = await heroSmsWaitForCode(activation.id);
+            console.log(`Hero-SMS code received: ${smsCode}`);
+
+            const codeBoxes = await page.$$('input[inputmode="numeric"][maxlength="1"], input[maxlength="1"]').catch(() => []);
+            if (codeBoxes && codeBoxes.length >= 4 && smsCode.length >= 4) {
+                const digits = smsCode.split('');
+                for (let i = 0; i < codeBoxes.length && i < digits.length; i++) {
+                    await fillInputValue(page, codeBoxes[i], digits[i]);
+                }
+            } else {
+                await fillInputValue(page, codeInputResult.handle, smsCode);
+            }
+
+            await clickButtonByText(page, /(verify|continue|next|confirm|submit|готов|подтверд)/i);
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+            await sleep(2500);
+            await takeScreenshot(page, '08f-phone-verified');
+
+            const url = page.url();
+            if (url.includes('add-phone')) {
+                throw new Error('phone_verification_still_required');
+            }
+
+            if (activation && activation.id) {
+                const doneResp = await heroSmsSetStatus(activation.id, 6);
+                console.log(`Hero-SMS setStatus(6): ${doneResp}`);
+            }
+            return { success: true };
+        } catch (err) {
+            lastReason = String(err && err.message ? err.message : err || 'unknown_error');
+            if (activation && activation.id) {
+                try {
+                    const cancelResp = await heroSmsSetStatus(activation.id, 8);
+                    console.log(`Hero-SMS setStatus(8): ${cancelResp}`);
+                    if (heroSmsNeedsDelayedCancel(cancelResp)) {
+                        scheduleHeroSmsCancelRetry(activation.id);
+                    }
+                } catch (cancelErr) {
+                    console.log(`Hero-SMS setStatus(8) error: ${String(cancelErr && cancelErr.message ? cancelErr.message : cancelErr)}`);
+                    scheduleHeroSmsCancelRetry(activation.id);
                 }
             }
+            console.log(`Hero-SMS country attempt failed: country=${country}, reason=${lastReason}`);
 
-            codeInputResult = await waitForAnySelector(page, [
-                'input[autocomplete="one-time-code"]',
-                'input[name*="code" i]',
-                'input[placeholder*="code" i]',
-                'input[inputmode="numeric"][maxlength="6"]',
-                'input[maxlength="6"]'
-            ], 10000);
-
-            if (codeInputResult) break;
-        }
-
-        if (!codeInputResult || !codeInputResult.handle) {
-            throw new Error('sms_code_input_not_found');
-        }
-
-        console.log(`Waiting for Hero-SMS code (timeout=${HERO_SMS_POLL_TIMEOUT_SEC}s)...`);
-        const smsCode = await heroSmsWaitForCode(activation.id);
-        console.log(`Hero-SMS code received: ${smsCode}`);
-
-        const codeBoxes = await page.$$('input[inputmode="numeric"][maxlength="1"], input[maxlength="1"]').catch(() => []);
-        if (codeBoxes && codeBoxes.length >= 4 && smsCode.length >= 4) {
-            const digits = smsCode.split('');
-            for (let i = 0; i < codeBoxes.length && i < digits.length; i++) {
-                await fillInputValue(page, codeBoxes[i], digits[i]);
+            const canTryNextCountry = /hero_sms_code_timeout|STATUS_WAIT_CODE|sms_code_input_not_found|hero_sms_get_number_failed|phone_input_not_found|phone_verification_still_required/i.test(lastReason);
+            if (!canTryNextCountry) {
+                return { success: false, reason: `phone_required:${lastReason}` };
             }
-        } else {
-            await fillInputValue(page, codeInputResult.handle, smsCode);
-        }
 
-        await clickButtonByText(page, /(verify|continue|next|confirm|submit|готов|подтверд)/i);
-        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-        await sleep(2500);
-        await takeScreenshot(page, '08f-phone-verified');
-
-        const url = page.url();
-        if (url.includes('add-phone')) {
-            throw new Error('phone_verification_still_required');
+            if (countryAttempt < countryRetryPlan.length - 1) {
+                await clickButtonByText(page, /(change|different|another|edit|use another|other number|back|друг|измен|назад)/i).catch(() => {});
+                await sleep(1000);
+            }
         }
-
-        if (activation && activation.id) {
-            const doneResp = await heroSmsSetStatus(activation.id, 6);
-            console.log(`Hero-SMS setStatus(6): ${doneResp}`);
-        }
-
-        return { success: true };
-    } catch (err) {
-        if (activation && activation.id) {
-            const cancelResp = await heroSmsSetStatus(activation.id, 8);
-            console.log(`Hero-SMS setStatus(8): ${cancelResp}`);
-        }
-        return { success: false, reason: `phone_required:${err.message}` };
     }
+
+    return { success: false, reason: `phone_required:${lastReason}` };
 }
 
 async function applySteadyBrowserProfile(page, profile, engine) {
@@ -1073,7 +1369,10 @@ imap.logout()
     return null;
 }
 
-async function takeScreenshot(page, name) {
+async function takeScreenshot(page, name, options = {}) {
+    if (!ENABLE_SCREENSHOTS && options.force !== true) {
+        return;
+    }
     try {
         await page.screenshot({ path: `/tmp/codex-login-${name}.png`, fullPage: false });
         console.log(`Screenshot saved: /tmp/codex-login-${name}.png`);
@@ -1149,9 +1448,9 @@ async function waitForPasswordOrKnownError(page, timeoutMs = 12000) {
 
 async function switchToSignInFlow(page, account, authUrl) {
     console.log('Navigating back to OAuth authUrl for Sign In flow...');
-    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: AUTH_PAGE_NAV_TIMEOUT_MS });
     await takeScreenshot(page, '06c-login-page');
-    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
+    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: EMAIL_INPUT_TIMEOUT_MS });
 
     // Enter email for Sign In
     console.log('Entering email for Sign In...');
@@ -1216,6 +1515,8 @@ async function switchToSignInFlow(page, account, authUrl) {
 }
 
 async function performLogin(authUrl) {
+    installSignalHandlers();
+
     const effectiveAuthUrl = normalizeAuthUrl(authUrl);
     if (effectiveAuthUrl !== authUrl) {
         console.log('Auth URL normalized: removed unstable simplified-flow query param');
@@ -1253,6 +1554,7 @@ async function performLogin(authUrl) {
                 } else {
                     anonymizedProxyUrl = await proxyChain.anonymizeProxy(proxyConfig.upstreamUrl);
                 }
+                activeAnonymizedProxyUrl = anonymizedProxyUrl;
                 proxyServerArg = anonymizedProxyUrl;
                 console.log(`Using local proxy bridge: ${proxyServerArg}`);
             } else {
@@ -1267,8 +1569,16 @@ async function performLogin(authUrl) {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-component-update',
+            '--disable-renderer-backgrounding',
             '--disable-blink-features=AutomationControlled',
             '--ignore-certificate-errors',
+            '--mute-audio',
+            '--renderer-process-limit=2',
             '--lang=en-US,en'
         ];
         if (proxyServerArg) {
@@ -1287,7 +1597,11 @@ async function performLogin(authUrl) {
         browser = launched.browser;
         page = launched.page;
         browserEngine = launched.engine;
+        activeBrowser = browser;
+        activeAnonymizedProxyUrl = anonymizedProxyUrl;
         console.log(`Browser engine selected: ${browserEngine}`);
+
+        await enableLeanPageRequests(page, browserEngine);
 
         page.on('pageerror', (err) => {
             console.log(`[PAGEERROR] ${err.message}`);
@@ -1305,6 +1619,7 @@ async function performLogin(authUrl) {
         let callbackUrl = null;
         let localRedirectUrl = null;
         let lastUrl = authUrl;
+        let passwordVerifyRejected = false;
         
         // Listen for all requests
         page.on('request', (request) => {
@@ -1328,6 +1643,9 @@ async function performLogin(authUrl) {
                 const contentType = headers['content-type'] || headers['Content-Type'] || '';
                 console.log(`[HTTP ${status}] ${url} content-type=${contentType}`);
             }
+            if (url.includes('/api/accounts/password/verify') && status === 401) {
+                passwordVerifyRejected = true;
+            }
             if (!callbackUrl && isCodexCallbackUrl(url)) {
                 callbackUrl = url;
                 console.log(`[RESPONSE] Callback URL from response: ${url}`);
@@ -1349,29 +1667,36 @@ async function performLogin(authUrl) {
 
         console.log('Navigating to auth page...');
         let lastGotoError = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let attempt = 1; attempt <= AUTH_PAGE_NAV_RETRIES; attempt++) {
             try {
                 await page.goto(effectiveAuthUrl, {
                     waitUntil: 'domcontentloaded',
-                    timeout: 60000
+                    timeout: AUTH_PAGE_NAV_TIMEOUT_MS
                 });
                 lastGotoError = null;
                 break;
             } catch (e) {
                 lastGotoError = e;
-                console.log(`Auth page navigation attempt ${attempt}/3 failed: ${e.message}`);
-                await new Promise(r => setTimeout(r, 2000));
+                console.log(`Auth page navigation attempt ${attempt}/${AUTH_PAGE_NAV_RETRIES} failed: ${e.message}`);
+                await new Promise(r => setTimeout(r, 1200));
             }
         }
         if (lastGotoError) {
             throw lastGotoError;
         }
         await takeScreenshot(page, '01-initial');
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, BLANK_PAGE_SETTLE_MS));
+
+        const loginPageSnapshot = await collectPageSnapshot(page);
+        console.log(`Login page snapshot: ready=${loginPageSnapshot.readyState} nodes=${loginPageSnapshot.nodeCount} text=${loginPageSnapshot.textLength} emailInputs=${loginPageSnapshot.emailInputs} title=${JSON.stringify(loginPageSnapshot.title)}`);
+        if (isProbablyBlankLoginPage(loginPageSnapshot)) {
+            await takeScreenshot(page, '01-blank-auth-page', { force: true });
+            return { success: false, reason: `blank_auth_page:${page.url()}` };
+        }
 
         // Wait for email input
         console.log('Waiting for email input...');
-        await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 10000 });
+        await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: EMAIL_INPUT_TIMEOUT_MS });
 
         // Default behavior is Sign In. Enable Sign Up explicitly when needed.
         const enableSignUpFlow = process.env.CODEX_ENABLE_SIGNUP_FLOW === '1' || ACCOUNT.forceSignUp === true;
@@ -2008,16 +2333,15 @@ async function performLogin(authUrl) {
             return { success: true, url: resultUrl };
         }
 
+        if (passwordVerifyRejected) {
+            return { success: false, reason: 'password_verify_401' };
+        }
+
         return { success: false, reason: 'No callback URL with auth code captured' };
     } catch (error) {
         throw error;
     } finally {
-        if (browser) {
-            await browser.close().catch(() => {});
-        }
-        if (anonymizedProxyUrl) {
-            await proxyChain.closeAnonymizedProxy(anonymizedProxyUrl, true).catch(() => {});
-        }
+        await cleanupActiveResources();
     }
 }
 

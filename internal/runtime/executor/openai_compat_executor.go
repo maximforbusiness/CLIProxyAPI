@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -32,6 +34,8 @@ const (
 	openAICompatDefaultImageEndpoint        = openAICompatImagesGenerationsPath
 	openAICompatMultipartMemory       int64 = 32 << 20
 )
+
+var nvidiaStableDiffusionEndpoint = "https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium"
 
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
 // It performs request/response translation and executes against the provider base URL
@@ -112,13 +116,30 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+	if opts.Alt == "responses/compact" {
+		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
+			translated = updated
+		}
+	}
+	if e.isNvidiaStableDiffusionModel(baseModel) {
+		if opts.Stream || opts.Alt == "responses/compact" {
+			err = statusErr{code: http.StatusBadRequest, msg: "stable-diffusion-3-medium does not support streaming or responses/compact"}
+			return
+		}
+		resp, err = e.executeNvidiaStableDiffusion(ctx, auth, req, opts, from, translated)
+		if err == nil {
+			reporter.EnsurePublished(ctx)
+		}
+		return
+	}
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
 	if opts.Alt == "responses/compact" {
@@ -288,6 +309,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if e.isNvidiaStableDiffusionModel(baseModel) {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "stable-diffusion-3-medium does not support streaming; set stream=false"}
+	}
 
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
@@ -566,6 +590,13 @@ func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cl
 
 func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	if e.isNvidiaStableDiffusionModel(baseModel) {
+		from := opts.SourceFormat
+		to := sdktranslator.FromString("openai")
+		usageJSON := helps.BuildOpenAIUsageJSON(0)
+		translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, 0, usageJSON)
+		return cliproxyexecutor.Response{Payload: translatedUsage}, nil
+	}
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
@@ -767,6 +798,255 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+func (e *OpenAICompatExecutor) isNvidiaStableDiffusionModel(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "stable-diffusion-3-medium", "stabilityai/stable-diffusion-3-medium":
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *OpenAICompatExecutor) executeNvidiaStableDiffusion(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
+	from sdktranslator.Format,
+	translated []byte,
+) (cliproxyexecutor.Response, error) {
+	_, apiKey := e.resolveCredentials(auth)
+	if strings.TrimSpace(apiKey) == "" {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusUnauthorized, msg: "missing provider api key"}
+	}
+
+	prompt := extractImagePrompt(translated)
+	if prompt == "" {
+		prompt = extractImagePrompt(req.Payload)
+	}
+	if prompt == "" {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: "missing prompt for stable-diffusion-3-medium"}
+	}
+
+	upstreamReq := []byte(`{}`)
+	var setErr error
+	upstreamReq, setErr = sjson.SetBytes(upstreamReq, "prompt", prompt)
+	if setErr != nil {
+		return cliproxyexecutor.Response{}, setErr
+	}
+	upstreamReq = copyRawIfExists(upstreamReq, "negative_prompt", gjson.GetBytes(translated, "negative_prompt"))
+	upstreamReq = copyRawIfExists(upstreamReq, "seed", gjson.GetBytes(translated, "seed"))
+	upstreamReq = copyRawIfExists(upstreamReq, "cfg_scale", gjson.GetBytes(translated, "cfg_scale"))
+	upstreamReq = copyRawIfExists(upstreamReq, "sampler", gjson.GetBytes(translated, "sampler"))
+	upstreamReq = copyRawIfExists(upstreamReq, "steps", gjson.GetBytes(translated, "steps"))
+	if aspectRatio := resolveNvidiaAspectRatio(translated); aspectRatio != "" {
+		if updated, errSet := sjson.SetBytes(upstreamReq, "aspect_ratio", aspectRatio); errSet == nil {
+			upstreamReq = updated
+		}
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, nvidiaStableDiffusionEndpoint, bytes.NewReader(upstreamReq))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL:       nvidiaStableDiffusionEndpoint,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      upstreamReq,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return cliproxyexecutor.Response{}, err
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("openai compat executor: close response body error: %v", errClose)
+		}
+	}()
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	body, readErr := io.ReadAll(httpResp.Body)
+	if readErr != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+		return cliproxyexecutor.Response{}, readErr
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(body)}
+	}
+
+	imageB64 := strings.TrimSpace(gjson.GetBytes(body, "image").String())
+	if imageB64 == "" {
+		imageB64 = strings.TrimSpace(gjson.GetBytes(body, "artifacts.0.base64").String())
+	}
+	if imageB64 == "" {
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: "nvidia image generation returned empty image field"}
+	}
+
+	openaiResp := []byte(`{"id":"","object":"chat.completion","created":0,"model":"","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	openaiResp, _ = sjson.SetBytes(openaiResp, "id", fmt.Sprintf("chatcmpl-nv-sd3-%d", time.Now().UnixNano()))
+	openaiResp, _ = sjson.SetBytes(openaiResp, "created", time.Now().Unix())
+	openaiResp, _ = sjson.SetBytes(openaiResp, "model", req.Model)
+	openaiResp, _ = sjson.SetBytes(openaiResp, "choices.0.message.content", imageB64)
+
+	to := sdktranslator.FromString("openai")
+	var param any
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, openaiResp, &param)
+	return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+}
+
+func copyRawIfExists(dst []byte, path string, value gjson.Result) []byte {
+	if !value.Exists() {
+		return dst
+	}
+	updated, err := sjson.SetRawBytes(dst, path, []byte(value.Raw))
+	if err != nil {
+		return dst
+	}
+	return updated
+}
+
+func resolveNvidiaAspectRatio(payload []byte) string {
+	if raw := strings.TrimSpace(gjson.GetBytes(payload, "aspect_ratio").String()); raw != "" {
+		return strings.ReplaceAll(raw, "/", ":")
+	}
+	width := int(gjson.GetBytes(payload, "width").Int())
+	height := int(gjson.GetBytes(payload, "height").Int())
+	if width <= 0 || height <= 0 {
+		size := strings.TrimSpace(gjson.GetBytes(payload, "size").String())
+		if size != "" {
+			parts := strings.Split(strings.ToLower(size), "x")
+			if len(parts) == 2 {
+				if w, errW := strconv.Atoi(strings.TrimSpace(parts[0])); errW == nil && w > 0 {
+					width = w
+				}
+				if h, errH := strconv.Atoi(strings.TrimSpace(parts[1])); errH == nil && h > 0 {
+					height = h
+				}
+			}
+		}
+	}
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	return reducedAspectRatio(width, height)
+}
+
+func reducedAspectRatio(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	g := gcd(width, height)
+	if g <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d", width/g, height/g)
+}
+
+func gcd(a, b int) int {
+	if a < 0 {
+		a = -a
+	}
+	if b < 0 {
+		b = -b
+	}
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func extractImagePrompt(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	if prompt := strings.TrimSpace(gjson.GetBytes(payload, "prompt").String()); prompt != "" {
+		return prompt
+	}
+
+	if messages := gjson.GetBytes(payload, "messages"); messages.IsArray() {
+		arr := messages.Array()
+		for i := len(arr) - 1; i >= 0; i-- {
+			msg := arr[i]
+			role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+			if role != "" && role != "user" {
+				continue
+			}
+			if text := extractContentText(msg.Get("content")); text != "" {
+				return text
+			}
+		}
+	}
+
+	if input := gjson.GetBytes(payload, "input"); input.IsArray() {
+		arr := input.Array()
+		for i := len(arr) - 1; i >= 0; i-- {
+			item := arr[i]
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "" && role != "user" {
+				continue
+			}
+			if text := extractContentText(item.Get("content")); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func extractContentText(content gjson.Result) string {
+	if !content.Exists() {
+		return ""
+	}
+	if content.IsArray() {
+		var builder strings.Builder
+		for _, part := range content.Array() {
+			text := strings.TrimSpace(part.Get("text").String())
+			if text == "" {
+				text = strings.TrimSpace(part.Get("content").String())
+			}
+			if text == "" {
+				text = strings.TrimSpace(part.String())
+			}
+			if text == "" {
+				continue
+			}
+			if builder.Len() > 0 {
+				builder.WriteString("\n")
+			}
+			builder.WriteString(text)
+		}
+		return strings.TrimSpace(builder.String())
+	}
+	return strings.TrimSpace(content.String())
 }
 
 type statusErr struct {

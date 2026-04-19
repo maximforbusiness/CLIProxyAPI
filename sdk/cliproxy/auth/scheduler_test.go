@@ -70,6 +70,23 @@ func registerSchedulerModels(t *testing.T, provider string, model string, authID
 	})
 }
 
+func registerSchedulerModelsForAuths(t *testing.T, provider string, models []string, authIDs ...string) {
+	t.Helper()
+	reg := registry.GetGlobalRegistry()
+	modelInfos := make([]*registry.ModelInfo, 0, len(models))
+	for _, model := range models {
+		modelInfos = append(modelInfos, &registry.ModelInfo{ID: model})
+	}
+	for _, authID := range authIDs {
+		reg.RegisterClient(authID, provider, modelInfos)
+	}
+	t.Cleanup(func() {
+		for _, authID := range authIDs {
+			reg.UnregisterClient(authID)
+		}
+	})
+}
+
 func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	t.Parallel()
 
@@ -91,6 +108,35 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 		}
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinBalancesAcrossFreshModelShards(t *testing.T) {
+	t.Parallel()
+
+	const provider = "qwen"
+	models := []string{"qwen-m1", "qwen-m2", "qwen-m3", "qwen-m4", "qwen-m5", "qwen-m6", "qwen-m7", "qwen-m8"}
+	registerSchedulerModelsForAuths(t, provider, models, "qwen-a", "qwen-b", "qwen-c", "qwen-d")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "qwen-a", Provider: provider},
+		&Auth{ID: "qwen-b", Provider: provider},
+		&Auth{ID: "qwen-c", Provider: provider},
+		&Auth{ID: "qwen-d", Provider: provider},
+	)
+
+	want := []string{"qwen-a", "qwen-b", "qwen-c", "qwen-d", "qwen-a", "qwen-b", "qwen-c", "qwen-d"}
+	for index, model := range models {
+		got, errPick := scheduler.pickSingle(context.Background(), provider, model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() model=%q error = %v", model, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() model=%q auth = nil", model)
+		}
+		if got.ID != want[index] {
+			t.Fatalf("pickSingle() model=%q auth.ID = %q, want %q", model, got.ID, want[index])
 		}
 	}
 }
