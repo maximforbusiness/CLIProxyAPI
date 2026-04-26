@@ -24,6 +24,7 @@ type RequestInfo struct {
 	Method    string              // Method is the HTTP method (e.g., GET, POST).
 	Headers   map[string][]string // Headers contains the request headers.
 	Body      []byte              // Body is the raw request body.
+	ClientIP  string              // ClientIP is the client's IP address (from X-Forwarded-For, X-Real-IP, or RemoteAddr).
 	RequestID string              // RequestID is the unique identifier for the request.
 	Timestamp time.Time           // Timestamp is when the request was received.
 }
@@ -163,6 +164,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 		streamWriter, err := w.logger.LogStreamingRequest(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
+			w.requestInfo.ClientIP,
 			w.requestInfo.Headers,
 			w.requestInfo.Body,
 			w.requestInfo.RequestID,
@@ -502,11 +504,12 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 	}
 
 	if loggerWithOptions, ok := w.logger.(interface {
-		LogRequestWithOptions(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
+		LogRequestWithOptions(string, string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, bool, string, time.Time, time.Time) error
 	}); ok {
 		return loggerWithOptions.LogRequestWithOptions(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
+			w.requestInfo.ClientIP,
 			w.requestInfo.Headers,
 			requestBody,
 			statusCode,
@@ -527,6 +530,7 @@ func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, h
 	return w.logger.LogRequest(
 		w.requestInfo.URL,
 		w.requestInfo.Method,
+		w.requestInfo.ClientIP,
 		w.requestInfo.Headers,
 		requestBody,
 		statusCode,

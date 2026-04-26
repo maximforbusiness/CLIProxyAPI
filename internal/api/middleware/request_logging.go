@@ -142,6 +142,9 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	// Capture method
 	method := c.Request.Method
 
+	// Capture client IP (checking X-Forwarded-For, X-Real-IP, then RemoteAddr)
+	clientIP := c.ClientIP()
+
 	// Capture headers
 	headers := make(map[string][]string)
 	for key, values := range c.Request.Header {
@@ -167,6 +170,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		Method:    method,
 		Headers:   headers,
 		Body:      body,
+		ClientIP:  clientIP,
 		RequestID: logging.GetGinRequestID(c),
 		Timestamp: time.Now(),
 	}, nil

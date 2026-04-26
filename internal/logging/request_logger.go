@@ -263,13 +263,14 @@ type RequestLogger interface {
 	//
 	// Returns:
 	//   - error: An error if logging fails, nil otherwise
-	LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error
+	LogRequest(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error
 
 	// LogStreamingRequest initiates logging for a streaming request and returns a writer for chunks.
 	//
 	// Parameters:
 	//   - url: The request URL
 	//   - method: The HTTP method
+	//   - clientIP: The client's IP address
 	//   - headers: The request headers
 	//   - body: The request body
 	//   - requestID: Optional request ID for log file naming
@@ -277,7 +278,7 @@ type RequestLogger interface {
 	// Returns:
 	//   - StreamingLogWriter: A writer for streaming response chunks
 	//   - error: An error if logging initialization fails, nil otherwise
-	LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error)
+	LogStreamingRequest(url, method, clientIP string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error)
 
 	// IsEnabled returns whether request logging is currently enabled.
 	//
@@ -489,6 +490,7 @@ func (l *FileRequestLogger) NewFileBodySource(prefix string) (*FileBodySource, e
 // Parameters:
 //   - url: The request URL
 //   - method: The HTTP method
+//   - clientIP: The client's IP address
 //   - requestHeaders: The request headers
 //   - body: The request body
 //   - statusCode: The response status code
@@ -502,28 +504,27 @@ func (l *FileRequestLogger) NewFileBodySource(prefix string) (*FileBodySource, e
 //
 // Returns:
 //   - error: An error if logging fails, nil otherwise
-func (l *FileRequestLogger) LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequest(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors, false, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) LogRequest(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequest(url, method, clientIP, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors, false, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
 // LogRequestWithOptions logs a request with optional forced logging behavior.
 // The force flag allows writing error logs even when regular request logging is disabled.
-func (l *FileRequestLogger) LogRequestWithOptions(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequestWithSources(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, nil, apiRequest, apiResponse, apiWebsocketTimeline, nil, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) LogRequestWithOptions(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequestWithSources(url, method, clientIP, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, nil, apiRequest, apiResponse, apiWebsocketTimeline, nil, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
-func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequestWithSources(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, nil, apiRequest, apiResponse, apiWebsocketTimeline, nil, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) logRequest(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequestWithSources(url, method, clientIP, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, nil, apiRequest, apiResponse, apiWebsocketTimeline, nil, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
 // LogRequestWithOptionsAndSources logs a request with optional file-backed large sections.
-func (l *FileRequestLogger) LogRequestWithOptionsAndSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
-	return l.logRequestWithSources(url, method, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, websocketTimelineSource, apiRequest, apiResponse, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
+func (l *FileRequestLogger) LogRequestWithOptionsAndSources(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	return l.logRequestWithSources(url, method, clientIP, requestHeaders, body, statusCode, responseHeaders, response, websocketTimeline, websocketTimelineSource, apiRequest, apiResponse, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors, force, requestID, requestTimestamp, apiResponseTimestamp)
 }
 
-func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+func (l *FileRequestLogger) logRequestWithSources(url, method, clientIP string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
 	defer cleanupFileBodySources(websocketTimelineSource, apiWebsocketTimelineSource)
-
 	if !l.enabled && !force {
 		return nil
 	}
@@ -601,6 +602,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		logFile,
 		url,
 		method,
+		clientIP,
 		requestHeaders,
 		body,
 		requestBodyPath,
@@ -642,6 +644,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 // Parameters:
 //   - url: The request URL
 //   - method: The HTTP method
+//   - clientIP: The client's IP address
 //   - headers: The request headers
 //   - body: The request body
 //   - requestID: Optional request ID for log file naming
@@ -649,7 +652,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 // Returns:
 //   - StreamingLogWriter: A writer for streaming response chunks
 //   - error: An error if logging initialization fails, nil otherwise
-func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error) {
+func (l *FileRequestLogger) LogStreamingRequest(url, method, clientIP string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error) {
 	if !l.enabled {
 		return &NoOpStreamingLogWriter{}, nil
 	}
@@ -695,6 +698,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		logFilePath:      filePath,
 		url:              url,
 		method:           method,
+		clientIP:         clientIP,
 		timestamp:        time.Now(),
 		requestHeaders:   requestHeaders,
 		requestBodyPath:  requestBodyPath,
@@ -870,7 +874,7 @@ func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error
 
 func (l *FileRequestLogger) writeNonStreamingLog(
 	w io.Writer,
-	url, method string,
+	url, method, clientIP string,
 	requestHeaders map[string][]string,
 	requestBody []byte,
 	requestBodyPath string,
@@ -894,7 +898,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	isWebsocketTranscript := hasSectionPayload(websocketTimeline) || hasFileBodySourcePayload(websocketTimelineSource)
 	downstreamTransport := inferDownstreamTransport(requestHeaders, websocketTimeline, websocketTimelineSource)
 	upstreamTransport := inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors)
-	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(w, url, method, clientIP, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISectionWithSource(w, "=== WEBSOCKET TIMELINE ===\n", "=== WEBSOCKET TIMELINE", websocketTimeline, websocketTimelineSource, time.Time{}); errWrite != nil {
@@ -923,7 +927,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 
 func writeRequestInfoWithBody(
 	w io.Writer,
-	url, method string,
+	url, method, clientIP string,
 	headers map[string][]string,
 	body []byte,
 	bodyPath string,
@@ -943,6 +947,11 @@ func writeRequestInfoWithBody(
 	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Method: %s\n", method)); errWrite != nil {
 		return errWrite
+	}
+	if clientIP != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Client IP: %s\n", clientIP)); errWrite != nil {
+			return errWrite
+		}
 	}
 	if strings.TrimSpace(downstreamTransport) != "" {
 		if _, errWrite := io.WriteString(w, fmt.Sprintf("Downstream Transport: %s\n", downstreamTransport)); errWrite != nil {
@@ -1560,6 +1569,9 @@ type FileStreamingLogWriter struct {
 	// method is the HTTP method.
 	method string
 
+	// clientIP is the client's IP address.
+	clientIP string
+
 	// timestamp is captured when the streaming log is initialized.
 	timestamp time.Time
 
@@ -1788,7 +1800,7 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 }
 
 func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
-	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiResponse, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.clientIP, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiResponse, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, time.Time{}); errWrite != nil {
