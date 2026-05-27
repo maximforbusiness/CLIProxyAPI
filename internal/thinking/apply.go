@@ -115,7 +115,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// Unknown models are treated as user-defined so thinking config can still be applied.
 	// The upstream service is responsible for validating the configuration.
 	if IsUserDefinedModel(modelInfo) {
-		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult)
+		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, providerKey, suffixResult)
 	}
 	if modelInfo.Thinking == nil {
 		config := extractThinkingConfig(body, providerFormat)
@@ -243,7 +243,7 @@ func parseSuffixToConfig(rawSuffix, provider, model string) ThinkingConfig {
 
 // applyUserDefinedModel applies thinking configuration for user-defined models
 // without ThinkingSupport validation.
-func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat string, suffixResult SuffixResult) ([]byte, error) {
+func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat, providerKey string, suffixResult SuffixResult) ([]byte, error) {
 	// Get model ID for logging
 	modelID := ""
 	if modelInfo != nil {
@@ -288,27 +288,39 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 		"level":    config.Level,
 	}).Debug("thinking: applying config for user-defined model (skip validation)")
 
-	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
+	config = normalizeUserDefinedConfig(config, fromFormat, toFormat, providerKey)
 	return applier.Apply(body, config, modelInfo)
 }
 
-func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
+func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat, providerKey string) ThinkingConfig {
 	if config.Mode != ModeLevel {
-		return config
+		// For OpenAI-compatible providers we still normalize budget-based configs
+		// to avoid unsupported effort levels like xhigh on strict backends.
+		if toFormat == "openai" && providerKey != "" && providerKey != "openai" && config.Mode == ModeBudget {
+			if level, ok := ConvertBudgetToLevel(config.Budget); ok {
+				config.Mode = ModeLevel
+				config.Budget = 0
+				config.Level = ThinkingLevel(level)
+			}
+		}
+	} else if toFormat != "claude" && isBudgetCapableProvider(toFormat) {
+		budget, ok := ConvertLevelToBudget(string(config.Level))
+		if ok {
+			config.Mode = ModeBudget
+			config.Budget = budget
+			config.Level = ""
+		}
 	}
-	if toFormat == "claude" {
-		return config
+
+	// Many OpenAI-compatible backends (e.g. vLLM-compatible APIs) only accept
+	// low/medium/high for reasoning_effort and reject xhigh/max.
+	// Keep official OpenAI behavior unchanged by limiting this to non-openai providers.
+	if toFormat == "openai" && providerKey != "" && providerKey != "openai" && config.Mode == ModeLevel {
+		switch strings.ToLower(strings.TrimSpace(string(config.Level))) {
+		case "xhigh", "max":
+			config.Level = LevelHigh
+		}
 	}
-	if !isBudgetCapableProvider(toFormat) {
-		return config
-	}
-	budget, ok := ConvertLevelToBudget(string(config.Level))
-	if !ok {
-		return config
-	}
-	config.Mode = ModeBudget
-	config.Budget = budget
-	config.Level = ""
 	return config
 }
 

@@ -401,12 +401,18 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
-// HomeEnabled reports whether the home control plane integration is enabled in the runtime config.
-func (m *Manager) HomeEnabled() bool {
+// RuntimeConfig returns the current runtime configuration.
+func (m *Manager) RuntimeConfig() *internalconfig.Config {
 	if m == nil {
-		return false
+		return nil
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg
+}
+
+// HomeEnabled reports whether the home control plane integration is enabled in the runtime config.
+func (m *Manager) HomeEnabled() bool {
+	cfg := m.RuntimeConfig()
 	return cfg != nil && cfg.Home.Enabled
 }
 

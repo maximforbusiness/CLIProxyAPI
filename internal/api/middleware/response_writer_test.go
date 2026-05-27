@@ -158,11 +158,11 @@ type testRequestLogger struct {
 	enabled bool
 }
 
-func (l *testRequestLogger) LogRequest(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, string, time.Time, time.Time) error {
+func (l *testRequestLogger) LogRequest(string, string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, string, time.Time, time.Time) error {
 	return nil
 }
 
-func (l *testRequestLogger) LogStreamingRequest(string, string, map[string][]string, []byte, string) (logging.StreamingLogWriter, error) {
+func (l *testRequestLogger) LogStreamingRequest(string, string, string, map[string][]string, []byte, string) (logging.StreamingLogWriter, error) {
 	return &testStreamingLogWriter{}, nil
 }
 

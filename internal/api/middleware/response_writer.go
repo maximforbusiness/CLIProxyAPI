@@ -18,6 +18,23 @@ const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
 
+const requestMetaHeaderRemoteAddr = "X-Proxy-Remote-Addr"
+const requestMetaHeaderForwardedFor = "X-Proxy-Forwarded-For"
+const requestMetaHeaderRealIP = "X-Proxy-Real-IP"
+const requestMetaHeaderTrueClientIP = "X-Proxy-True-Client-IP"
+const requestMetaHeaderCFConnectingIP = "X-Proxy-CF-Connecting-IP"
+const requestMetaHeaderForwarded = "X-Proxy-Forwarded"
+const requestMetaHeaderUserAgent = "X-Proxy-User-Agent"
+const requestMetaHeaderOrigin = "X-Proxy-Origin"
+const requestMetaHeaderReferer = "X-Proxy-Referer"
+const requestMetaHeaderAPIKeyFingerprint = "X-Proxy-API-Key-Fingerprint"
+const requestMetaHeaderAuthFingerprint = "X-Proxy-Authorization-Fingerprint"
+const requestMetaHeaderAuthenticatedPrincipalFingerprint = "X-Proxy-Authenticated-Principal-Fingerprint"
+const requestMetaHeaderAccessProvider = "X-Proxy-Access-Provider"
+const requestMetaHeaderRequestedModel = "X-Proxy-Requested-Model"
+const requestMetaHeaderRequestBodySHA256 = "X-Proxy-Request-Body-SHA256"
+const requestMetaHeaderRequestBodySize = "X-Proxy-Request-Body-Size"
+
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
 	URL       string              // URL is the request URL.
@@ -44,6 +61,7 @@ type ResponseWriterWrapper struct {
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	ginContext          *gin.Context               // ginContext provides access to auth metadata set by downstream middleware.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -158,6 +176,9 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	// Detect streaming based on Content-Type
 	contentType := w.ResponseWriter.Header().Get("Content-Type")
 	w.isStreaming = w.detectStreaming(contentType)
+
+	// Enrich request metadata with auth context before the request is persisted.
+	w.enrichRequestInfoFromContext(w.ginContext)
 
 	// If streaming, initialize streaming log writer
 	if w.isStreaming && w.logger.IsEnabled() {
@@ -288,6 +309,8 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		cleanupFileBodySources(websocketTimelineSource, apiWebsocketTimelineSource)
 		return nil
 	}
+
+	w.enrichRequestInfoFromContext(c)
 
 	if w.isStreaming && w.streamWriter != nil {
 		if w.chunkChannel != nil {
@@ -576,4 +599,35 @@ func cleanupFileBodySources(sources ...*logging.FileBodySource) {
 		}
 		_ = source.Cleanup()
 	}
+}
+
+func (w *ResponseWriterWrapper) enrichRequestInfoFromContext(c *gin.Context) {
+	if w == nil || w.requestInfo == nil || c == nil {
+		return
+	}
+	if w.requestInfo.Headers == nil {
+		w.requestInfo.Headers = make(map[string][]string)
+	}
+
+	if provider, exists := c.Get("accessProvider"); exists {
+		if providerString, ok := provider.(string); ok {
+			w.setRequestMetaHeader(requestMetaHeaderAccessProvider, providerString)
+		}
+	}
+	if principal, exists := c.Get("apiKey"); exists {
+		if principalString, ok := principal.(string); ok {
+			w.setRequestMetaHeader(requestMetaHeaderAuthenticatedPrincipalFingerprint, fingerprintValue(principalString))
+		}
+	}
+}
+
+func (w *ResponseWriterWrapper) setRequestMetaHeader(key, value string) {
+	if w == nil || w.requestInfo == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return
+	}
+	w.requestInfo.Headers[key] = []string{trimmed}
 }

@@ -817,43 +817,26 @@ async function heroSmsSetStatus(activationId, status) {
 
 async function heroSmsAcquireActivationFromPlan(acquirePlan) {
     let lastReason = 'no_attempts';
-    const perCandidateRetries = Math.max(1, parseInt(process.env.HERO_SMS_GETNUMBER_RETRIES || '5', 10) || 5);
-    const retryDelayMs = Math.max(500, parseInt(process.env.HERO_SMS_GETNUMBER_RETRY_DELAY_MS || '1200', 10) || 1200);
-
     for (const candidate of (acquirePlan || [])) {
         const country = candidate.country;
         const service = candidate.service;
+        const raw = await heroSmsRequest({
+            action: 'getNumber',
+            service,
+            country
+        });
 
-        for (let attempt = 1; attempt <= perCandidateRetries; attempt++) {
-            const raw = await heroSmsRequest({
-                action: 'getNumber',
-                service,
-                country
-            });
+        const activation = parseHeroActivation(raw);
+        if (activation && activation.id && activation.phone) {
+            console.log(`Hero-SMS activation acquired: id=${activation.id}, country=${country}, service=${service}, price=${candidate.hasPrice ? candidate.cost : 'n/a'}, phone=${activation.phone}`);
+            return { ...activation, country, service, cost: candidate.hasPrice ? candidate.cost : null };
+        }
 
-            const activation = parseHeroActivation(raw);
-            if (activation && activation.id && activation.phone) {
-                console.log(`Hero-SMS activation acquired: id=${activation.id}, country=${country}, service=${service}, price=${candidate.hasPrice ? candidate.cost : 'n/a'}, phone=${activation.phone}`);
-                return { ...activation, country, service, cost: candidate.hasPrice ? candidate.cost : null };
-            }
-
-            const reason = heroSmsErrorText(raw);
-            lastReason = `country=${country},service=${service},reason=${reason}`;
-            console.log(`Hero-SMS getNumber country=${country} service=${service} try=${attempt}/${perCandidateRetries} price=${candidate.hasPrice ? candidate.cost : 'n/a'}: ${reason}`);
-
-            const retriableNoNumbers = /NO_NUMBERS/i.test(reason);
-            const terminal = /SERVICE_NOT_AVAILABLE|BAD_SERVICE|BAD_COUNTRY|NO_BALANCE/i.test(reason);
-
-            if (terminal) {
-                break;
-            }
-            if (retriableNoNumbers && attempt < perCandidateRetries) {
-                await sleep(retryDelayMs);
-                continue;
-            }
-            if (!retriableNoNumbers) {
-                break;
-            }
+        const reason = heroSmsErrorText(raw);
+        lastReason = `country=${country},service=${service},reason=${reason}`;
+        console.log(`Hero-SMS getNumber country=${country} service=${service} price=${candidate.hasPrice ? candidate.cost : 'n/a'}: ${reason}`);
+        if (!/NO_NUMBERS|SERVICE_NOT_AVAILABLE|BAD_SERVICE|BAD_COUNTRY|NO_BALANCE/i.test(reason)) {
+            break;
         }
     }
 
@@ -1013,22 +996,6 @@ async function completePhoneVerificationWithHeroSMS(page) {
 
             const phoneCandidates = [`+${activation.phone}`, activation.phone];
             let codeInputResult = null;
-            let deliveryMode = 'unknown';
-
-            const detectDeliveryMode = async () => {
-                const snap = await page.evaluate(() => {
-                    const txt = (document.body && document.body.innerText) ? document.body.innerText : '';
-                    return txt.slice(0, 6000);
-                }).catch(() => '');
-                const text = String(snap || '').toLowerCase();
-                if (/unable to send a verification code to this phone number|please try again later|use a different number|could not send code|number is not supported/i.test(text)) {
-                    return { mode: 'rejected', text: snap };
-                }
-                if (/whatsapp|what\s*app/.test(text)) return { mode: 'whatsapp', text: snap };
-                if (/sms|text message|verification code|enter code|one[- ]time code|otp|resend text message/.test(text)) return { mode: 'sms', text: snap };
-                return { mode: 'unknown', text: snap };
-            };
-
             for (const phoneCandidate of phoneCandidates) {
                 console.log(`Trying phone candidate: ${phoneCandidate}`);
                 await fillInputValue(page, phoneInputResult.handle, phoneCandidate);
@@ -1046,33 +1013,13 @@ async function completePhoneVerificationWithHeroSMS(page) {
                     }
                 }
 
-                // Fast UI decision: do NOT wait 120s if target clearly requests WhatsApp or rejects number.
-                await sleep(2500);
-                const modeInfo = await detectDeliveryMode();
-                deliveryMode = modeInfo.mode;
-                console.log(`Phone step UI mode: ${deliveryMode}`);
-                if (modeInfo.text) {
-                    console.log(`Phone step UI text preview: ${modeInfo.text.replace(/\s+/g, ' ').slice(0, 300)}`);
-                }
+                codeInputResult = await waitForAnySelector(page, codeInputSelectors, 10000);
 
-                if (deliveryMode === 'whatsapp') {
-                    throw new Error('phone_requires_whatsapp');
-                }
-                if (deliveryMode === 'rejected') {
-                    throw new Error('phone_rejected_by_openai');
-                }
-
-                codeInputResult = await waitForAnySelector(page, codeInputSelectors, 3500);
                 if (codeInputResult) break;
-
-                // If we don't have code input quickly, do not burn time.
-                if (deliveryMode === 'unknown' || deliveryMode === 'sms' || deliveryMode === 'rejected') {
-                    continue;
-                }
             }
 
             if (!codeInputResult || !codeInputResult.handle) {
-                throw new Error(deliveryMode === 'whatsapp' ? 'phone_requires_whatsapp' : 'sms_code_input_not_found');
+                throw new Error('sms_code_input_not_found');
             }
 
             console.log(`Waiting for Hero-SMS code (timeout=${HERO_SMS_POLL_TIMEOUT_SEC}s)...`);
@@ -1120,7 +1067,7 @@ async function completePhoneVerificationWithHeroSMS(page) {
             }
             console.log(`Hero-SMS country attempt failed: country=${country}, reason=${lastReason}`);
 
-            const canTryNextCountry = /hero_sms_code_timeout|STATUS_WAIT_CODE|sms_code_input_not_found|hero_sms_get_number_failed|phone_input_not_found|phone_verification_still_required|phone_requires_whatsapp/i.test(lastReason);
+            const canTryNextCountry = /hero_sms_code_timeout|STATUS_WAIT_CODE|sms_code_input_not_found|hero_sms_get_number_failed|phone_input_not_found|phone_verification_still_required/i.test(lastReason);
             if (!canTryNextCountry) {
                 return { success: false, reason: `phone_required:${lastReason}` };
             }
@@ -1253,117 +1200,169 @@ async function launchBrowserPage({
     throw new Error(`browser_launch_failed:${launchErrors.join(' | ')}`);
 }
 
-// Get verification code from Gmail IMAP (app password).
-// waitForNewEmail=true makes it wait for message count growth before reading code.
-async function getVerificationCodeFromIMAP(email, password, waitSeconds = 60, waitForNewEmail = false) {
+// Get verification code from Firstmail IMAP
+async function getVerificationCodeFromIMAP(email, password, waitSeconds = 60) {
     console.log(`Waiting for verification email at ${email}...`);
-
-    const IMAP_HOST = 'imap.gmail.com';
+    
+    const IMAP_HOST = 'imap.firstmail.ltd';
     const IMAP_PORT = 993;
-    const appPassword = String(process.env.CODEX_GMAIL_APP_PASSWORD || password || '').replace(/\s+/g, '');
-
-    console.log(`Gmail IMAP: ${IMAP_HOST}:${IMAP_PORT}`);
-
+    
     const startTime = Date.now();
-    let initialCount = 0;
+    let lastCount = 0;
 
-    if (waitForNewEmail) {
-        try {
-            const initialResult = execSync(`python3 -c "
+    try {
+        const initialResult = execSync(`python3 -c "
 import imaplib
-imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
-imap.login('${email.replace(/'/g, "'\\''")}', '${appPassword.replace(/'/g, "'\\''")}')
-imap.select('INBOX')
-status, msgs = imap.search(None, 'ALL')
-count = len(msgs[0].split()) if msgs[0] else 0
-imap.close()
-imap.logout()
-print(count)
+try:
+    imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+    imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+    status, msgs = imap.select('INBOX')
+    count = len(msgs[0].split()) if msgs[0] else 0
+    imap.close()
+    imap.logout()
+    print(count)
+except Exception:
+    print('0')
 "`, { encoding: 'utf8', timeout: 10000 });
-            initialCount = parseInt(initialResult.trim(), 10) || 0;
-            console.log(`Initial inbox count: ${initialCount}`);
-        } catch {
-            initialCount = 0;
-        }
+        lastCount = parseInt(initialResult.trim()) || 0;
+        console.log(`Initial inbox count: ${lastCount}`);
+    } catch (e) {
+        lastCount = 0;
     }
-
+    
     while (Date.now() - startTime < waitSeconds * 1000) {
         try {
-            if (waitForNewEmail) {
-                const countResult = execSync(`python3 -c "
+            // Check message count using Python IMAP
+            const result = execSync(`python3 -c "
 import imaplib
-imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
-imap.login('${email.replace(/'/g, "'\\''")}', '${appPassword.replace(/'/g, "'\\''")}')
-imap.select('INBOX')
-status, msgs = imap.search(None, 'ALL')
-count = len(msgs[0].split()) if msgs[0] else 0
-imap.close()
-imap.logout()
-print(count)
+try:
+    imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+    imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+    status, msgs = imap.select('INBOX')
+    count = len(msgs[0].split()) if msgs[0] else 0
+    imap.close()
+    imap.logout()
+    print(count)
+except Exception as e:
+    print('0')
 "`, { encoding: 'utf8', timeout: 10000 });
-                const currentCount = parseInt(countResult.trim(), 10) || 0;
-                if (currentCount <= initialCount) {
-                    await new Promise(r => setTimeout(r, 2500));
-                    continue;
-                }
-                console.log(`New email detected! Count: ${initialCount} -> ${currentCount}`);
-                initialCount = currentCount;
-            }
-
-            const codeResult = execSync(`python3 -c "
+            
+            const count = parseInt(result.trim()) || 0;
+            
+            if (count > lastCount) {
+                // New email! Get the code
+                console.log(`New email received! Count: ${count}`);
+                
+                const emailResult = execSync(`python3 -c "
 import imaplib
 import email as email_lib
 import re
 
 imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
-imap.login('${email.replace(/'/g, "'\\''")}', '${appPassword.replace(/'/g, "'\\''")}')
+imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
 imap.select('INBOX')
 
 status, msgs = imap.search(None, 'ALL')
 if msgs[0]:
-    nums = msgs[0].split()
-    if nums:
-        num = nums[-1]
+    msg_nums = msgs[0].split()[-1:]
+    for num in msg_nums:
         status, data = imap.fetch(num, '(RFC822)')
         if data[0]:
             msg = email_lib.message_from_bytes(data[0][1])
-            plain = ''
-            html = ''
+            subject = msg.get('Subject', '')
+            
+            body = ''
             if msg.is_multipart():
                 for part in msg.walk():
-                    ctype = part.get_content_type()
-                    payload = part.get_payload(decode=True)
-                    if not payload:
-                        continue
-                    text = payload.decode('utf-8', errors='ignore')
-                    if ctype == 'text/plain' and not plain:
-                        plain = text
-                    elif ctype == 'text/html' and not html:
-                        html = text
+                    if part.get_content_type() == 'text/plain':
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            break
             else:
                 payload = msg.get_payload(decode=True)
                 if payload:
-                    plain = payload.decode('utf-8', errors='ignore')
-
-            search_text = plain if plain.strip() else html
-            matches = re.findall(r'\\b\\d{6}\\b', search_text)
-            if matches:
-                print(matches[-1])
+                    body = payload.decode('utf-8', errors='ignore')
+            
+            text = subject + ' ' + body
+            
+            # Look for 6-digit code
+            match = re.search(r'\\b\\d{6}\\b', text)
+            if match:
+                print(match.group())
+            else:
+                print('')
+            
+            break
 
 imap.close()
 imap.logout()
 "`, { encoding: 'utf8', timeout: 10000 });
-
-            const code = codeResult.trim();
-            if (/^\d{6}$/.test(code)) {
-                console.log(`✓ Verification code: ${code}`);
-                return code;
+                
+                const code = emailResult.trim();
+                if (code && code.match(/^\d{6}$/)) {
+                    console.log(`✓ Verification code: ${code}`);
+                    return code;
+                }
             }
+            
+            lastCount = count;
         } catch (error) {
             console.log(`IMAP check error: ${error.message}`);
         }
+        
+        await new Promise(r => setTimeout(r, 3000));
+    }
+    
+    // Fallback: use latest inbox message code when count did not change (race condition).
+    try {
+        console.log('No new email detected. Trying latest message code as fallback...');
+        const latestCodeResult = execSync(`python3 -c "
+import imaplib
+import email as email_lib
+import re
 
-        await new Promise(r => setTimeout(r, 2500));
+imap = imaplib.IMAP4_SSL('${IMAP_HOST}', ${IMAP_PORT})
+imap.login('${email.replace(/'/g, "'\\''")}', '${password.replace(/'/g, "'\\''")}')
+imap.select('INBOX')
+
+status, msgs = imap.search(None, 'ALL')
+if msgs[0]:
+    msg_nums = msgs[0].split()[-1:]
+    for num in msg_nums:
+        status, data = imap.fetch(num, '(RFC822)')
+        if data[0]:
+            msg = email_lib.message_from_bytes(data[0][1])
+            subject = msg.get('Subject', '')
+            body = ''
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode('utf-8', errors='ignore')
+                            break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode('utf-8', errors='ignore')
+            text = subject + ' ' + body
+            match = re.search(r'\\b\\d{6}\\b', text)
+            if match:
+                print(match.group())
+            else:
+                print('')
+            break
+imap.close()
+imap.logout()
+"`, { encoding: 'utf8', timeout: 10000 });
+        const latestCode = latestCodeResult.trim();
+        if (latestCode && latestCode.match(/^\d{6}$/)) {
+            console.log(`✓ Fallback verification code: ${latestCode}`);
+            return latestCode;
+        }
+    } catch (e) {
+        // ignore fallback errors
     }
 
     console.log('✗ Timeout waiting for verification code');
@@ -1708,30 +1707,18 @@ async function performLogin(authUrl) {
                     const style = window.getComputedStyle(el);
                     return style && style.display !== 'none' && style.visibility !== 'hidden';
                 };
+                const patterns = [/sign up/i, /create account/i, /register/i, /continue with email/i, /use email/i];
                 const nodes = Array.from(document.querySelectorAll('a,button,[role="button"]'));
-
-                const pick = (predicate) => {
-                    for (const node of nodes) {
-                        if (!node || !looksVisible(node)) continue;
-                        const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-                        const href = String(node.getAttribute && node.getAttribute('href') || '');
-                        if (!predicate(text, href)) continue;
-                        node.click();
-                        return text || href || 'clicked';
-                    }
-                    return '';
-                };
-
-                // 1) Prefer explicit email signup controls
-                let hit = pick((text, href) => /sign up with email|continue with email|use email|email/i.test(text) || /email/i.test(href));
-                if (hit) return hit;
-
-                // 2) Fallback to generic signup/create-account, but never Google buttons
-                hit = pick((text, href) => {
-                    if (/google/i.test(text) || /google/i.test(href)) return false;
-                    return /sign up|create account|register/i.test(text) || /signup|register|create-account/i.test(href);
-                });
-                return hit;
+                for (const node of nodes) {
+                    if (!node || !looksVisible(node)) continue;
+                    const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                    const href = String(node.getAttribute && node.getAttribute('href') || '');
+                    const hasMatch = patterns.some((re) => re.test(text)) || /signup|register|create-account/i.test(href);
+                    if (!hasMatch) continue;
+                    node.click();
+                    return text || href || 'clicked';
+                }
+                return '';
             });
 
             if (signUpClicked) {
@@ -2001,7 +1988,7 @@ async function performLogin(authUrl) {
         pageUrl = page.url();
         if (pageUrl.includes('email-verification')) {
             console.log('Email verification page detected after sign-in. Getting code from IMAP...');
-            const signInEmailCode = await getVerificationCodeFromIMAP(ACCOUNT.email, ACCOUNT.password, 90, true);
+            const signInEmailCode = await getVerificationCodeFromIMAP(ACCOUNT.email, ACCOUNT.password, 90);
             if (signInEmailCode) {
                 console.log(`Email verification code: ${signInEmailCode}`);
                 const verifyCodeInput = await page.$('input[type="text"][maxlength="6"], input[placeholder*="code" i], input[name="code"]');
@@ -2036,9 +2023,19 @@ async function performLogin(authUrl) {
         // Check if we're on the about-you page (Sign Up flow)
         const isAboutYouPage = newPageUrl.includes('about-you');
         if (isAboutYouPage) {
-            console.log('About-you page detected - entering age/name and DOB...');
+            console.log('About-you page detected - entering name and DOB...');
             const fullName = buildValidFullName(ACCOUNT.name, ACCOUNT.email);
             console.log(`Using full name: ${fullName}`);
+            
+            // Enter name
+            const nameInput = await page.$('input[name*="name"], input[placeholder*="name" i], input[aria-label*="name" i]');
+            if (nameInput) {
+                console.log('Entering name...');
+                await nameInput.click({ clickCount: 3 });
+                await page.keyboard.press('Backspace');
+                await nameInput.click();
+                await page.keyboard.type(fullName, { delay: 50 });
+            }
             
             // Enter age/birthday (varies by locale and experiment bucket)
             const birthYear = ACCOUNT.birthYear || 2000;
@@ -2046,7 +2043,7 @@ async function performLogin(authUrl) {
             const birthDay = String(ACCOUNT.birthDay || 15).padStart(2, '0');
             const dobDisplay = `${birthMonth}/${birthDay}/${birthYear}`;
             const dobISO = `${birthYear}-${birthMonth}-${birthDay}`;
-            const ageValue = String(Math.max(22, Number(ACCOUNT.age || 22)));
+            const ageValue = String(new Date().getFullYear() - birthYear);
 
             const aboutYouText = await page.content();
             const isAgePrompt = /how old are you\?/i.test(aboutYouText) ||
@@ -2055,58 +2052,8 @@ async function performLogin(authUrl) {
 
             console.log(`Entering age/birthday: mode=${isAgePrompt ? 'age' : 'birthday'}, age=${ageValue}, dob=${dobDisplay}`);
 
-            // Name first (as required by target form ordering)
-            const nameInput = await page.$('input[name*="name"], input[placeholder*="name" i], input[aria-label*="name" i]');
-            if (nameInput) {
-                console.log('Entering name first...');
-                await nameInput.click({ clickCount: 3 }).catch(() => {});
-                await page.keyboard.press('Backspace').catch(() => {});
-                await nameInput.click().catch(() => {});
-                await page.keyboard.type(fullName, { delay: 50 }).catch(() => {});
-            }
-
             let ageDobValue = '';
             let usedSpinbuttonDateField = false;
-
-            // Debug form structure + strict 2-field mode (name + age)
-            const formSnapshot = await page.evaluate(() => {
-                const vis = (el) => {
-                    const st = window.getComputedStyle(el);
-                    return st.display !== 'none' && st.visibility !== 'hidden';
-                };
-                const fields = Array.from(document.querySelectorAll('input, textarea, select'))
-                    .filter(vis)
-                    .map((el, idx) => ({
-                        idx,
-                        tag: el.tagName.toLowerCase(),
-                        type: (el.type || '').toLowerCase(),
-                        name: el.name || '',
-                        id: el.id || '',
-                        placeholder: el.placeholder || '',
-                        aria: el.getAttribute('aria-label') || ''
-                    }));
-                return fields;
-            }).catch(() => []);
-            console.log('About-you visible fields:', JSON.stringify(formSnapshot));
-
-            const visibleTextInputs = formSnapshot.filter((f) => f.tag === 'input' && !['hidden','checkbox','radio','submit','button'].includes(f.type));
-            const hasNameField = visibleTextInputs.some((f) => /name/i.test(`${f.name} ${f.id} ${f.placeholder} ${f.aria}`));
-            const hasAgeField = visibleTextInputs.some((f) => /age/i.test(`${f.name} ${f.id} ${f.placeholder} ${f.aria}`));
-
-            if (visibleTextInputs.length <= 3 && hasNameField && hasAgeField) {
-                console.log('About-you strict mode: filling NAME then AGE');
-                const nameHandle = await page.$('input[name*="name" i], input[id*="name" i], input[placeholder*="name" i], input[aria-label*="name" i]');
-                if (nameHandle) {
-                    await fillInputValue(page, nameHandle, fullName).catch(() => {});
-                }
-                const ageHandle = await page.$('input[name*="age" i], input[id*="age" i], input[placeholder*="age" i], input[aria-label*="age" i]');
-                if (ageHandle) {
-                    await fillInputValue(page, ageHandle, ageValue).catch(() => {});
-                    ageDobValue = await ageHandle.evaluate(el => el.value || '').catch(() => ageValue);
-                }
-                await sleep(600);
-                await takeScreenshot(page, '08-about-you-strict-name-age');
-            }
 
             const monthSegment = await page.$('div[role="spinbutton"][data-type="month"]');
             const daySegment = await page.$('div[role="spinbutton"][data-type="day"]');
@@ -2156,7 +2103,6 @@ async function performLogin(authUrl) {
                 }
             }
             console.log(`Age/Birthday field value after typing: ${ageDobValue}`);
-
 
             // Fallback: try forcing hidden birthday value if spinbutton/input typing did not update it.
             const hiddenBirthdayInput = await page.$('input[name="birthday"]');
@@ -2267,143 +2213,6 @@ async function performLogin(authUrl) {
             }
             newPageUrl = page.url();
             console.log(`After phone verification - URL: ${newPageUrl}`);
-        }
-
-        // If phone verification led to about-you, complete it now.
-        if (newPageUrl.includes('about-you')) {
-            console.log('About-you page detected after phone verification. Completing profile...');
-
-            const rawName = (ACCOUNT.name && String(ACCOUNT.name).trim()) ? String(ACCOUNT.name).trim() : 'Alex Stone';
-            // OpenAI about-you often rejects names with digits/symbols; keep only letters/spaces.
-            const cleanedName = rawName
-                .replace(/[^a-zA-Z\s-]/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim();
-            const fullName = /^[A-Za-z]+(?:[\s-][A-Za-z]+)+$/.test(cleanedName) ? cleanedName : 'Alex Stone';
-
-            // Force adult age > 21 for this flow
-            const birthYear = Number(ACCOUNT.birthYear || 1996);
-            const birthMonth = Number(ACCOUNT.birthMonth || 1);
-            const birthDay = Number(ACCOUNT.birthDay || 15);
-            const ageValue = String(Math.max(22, Math.min(65, new Date().getFullYear() - birthYear)));
-            const dobISO = `${birthYear}-${String(birthMonth).padStart(2, '0')}-${String(birthDay).padStart(2, '0')}`;
-            const dobDisplay = `${String(birthMonth).padStart(2, '0')}/${String(birthDay).padStart(2, '0')}/${birthYear}`;
-
-            const nameInput = await page.$('input[name*="name" i], input[placeholder*="name" i], input[aria-label*="name" i]');
-            if (nameInput) {
-                await fillInputValue(page, nameInput, fullName);
-            }
-
-            const ageDobInput = await page.$('input[name*="birth" i], input[id*="birth" i], input[placeholder*="birth" i], input[aria-label*="birth" i], input[placeholder*="age" i], input[aria-label*="age" i], input[autocomplete="bday"], input[type="date"]');
-            if (ageDobInput) {
-                const isAgePrompt = await page.evaluate((el) => {
-                    const ctx = `${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''} ${el.name || ''} ${el.id || ''}`.toLowerCase();
-                    return /age/.test(ctx) && !/birth|date|dob/.test(ctx);
-                }, ageDobInput).catch(() => false);
-                await fillInputValue(page, ageDobInput, isAgePrompt ? ageValue : dobDisplay);
-            }
-
-            const hiddenBirthdayInput = await page.$('input[name="birthday"]');
-            if (hiddenBirthdayInput) {
-                await hiddenBirthdayInput.evaluate((el, iso) => {
-                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-                    if (setter) {
-                        setter.call(el, iso);
-                    } else {
-                        el.value = iso;
-                    }
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                }, dobISO).catch(() => {});
-            }
-
-            await sleep(1000);
-            await takeScreenshot(page, '08-about-you-after-phone-filled');
-
-            const finishBtn = await page.$('button[type="submit"]') ||
-                              await firstXPath(page, '//button[contains(text(), "Finish") or contains(text(), "Continue") or contains(text(), "Next")]');
-            if (finishBtn) {
-                await finishBtn.click().catch(() => {});
-                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-            } else {
-                await page.keyboard.press('Enter').catch(() => {});
-                await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
-            }
-
-            await sleep(2500);
-            await takeScreenshot(page, '08b-about-you-after-phone-submitted');
-
-            // Retry once if still on about-you after phone flow.
-            if (page.url().includes('about-you')) {
-                console.log('Still on about-you (post-phone), retrying submission with fallback fields...');
-
-                // Generic autofill pass for any visible form controls
-                await page.evaluate((name, month, day, year) => {
-                    const isVisible = (el) => {
-                        const st = window.getComputedStyle(el);
-                        return st.display !== 'none' && st.visibility !== 'hidden';
-                    };
-                    const all = Array.from(document.querySelectorAll('input, textarea, select'));
-                    for (const el of all) {
-                        if (!el || !isVisible(el) || el.disabled) continue;
-                        const meta = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''} ${el.getAttribute('aria-label') || ''}`.toLowerCase();
-                        if (el.type === 'checkbox') {
-                            el.checked = true;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                            continue;
-                        }
-                        if (meta.includes('name')) {
-                            el.value = name;
-                        } else if (meta.includes('birth') || meta.includes('dob') || meta.includes('date')) {
-                            if (el.type === 'date') {
-                                el.value = `${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
-                            } else {
-                                el.value = `${String(month).padStart(2,'0')}/${String(day).padStart(2,'0')}/${year}`;
-                            }
-                        } else if (meta.includes('age')) {
-                            const age = Math.max(18, Math.min(65, new Date().getFullYear() - year));
-                            el.value = String(age);
-                        }
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }, fullName || 'Alex Stone', Number(birthMonth), Number(birthDay), Number(birthYear)).catch(() => {});
-
-                const retryMonth = await page.$('div[role="spinbutton"][data-type="month"]');
-                const retryDay = await page.$('div[role="spinbutton"][data-type="day"]');
-                const retryYear = await page.$('div[role="spinbutton"][data-type="year"]');
-                if (retryMonth && retryDay && retryYear) {
-                    const fillRetrySegment = async (handle, value) => {
-                        await handle.click({ clickCount: 3 }).catch(() => {});
-                        await page.keyboard.press('Backspace').catch(() => {});
-                        await handle.click().catch(() => {});
-                        await page.keyboard.type(value, { delay: 30 }).catch(() => {});
-                    };
-                    await fillRetrySegment(retryMonth, String(Number(birthMonth)));
-                    await fillRetrySegment(retryDay, String(Number(birthDay)));
-                    await fillRetrySegment(retryYear, String(birthYear));
-                }
-
-                // Try multiple submit button patterns
-                let retryFinishBtn = await page.$('button[type="submit"]');
-                if (!retryFinishBtn) retryFinishBtn = await firstXPath(page, '//button[contains(text(), "Finish") or contains(text(), "Continue") or contains(text(), "Next") or contains(text(), "Done") or contains(text(), "Start")]');
-                if (!retryFinishBtn) retryFinishBtn = await firstXPath(page, '//a[contains(text(), "Continue") or contains(text(), "Next")]');
-
-                if (retryFinishBtn) {
-                    await retryFinishBtn.click().catch(() => {});
-                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-                } else {
-                    await page.keyboard.press('Enter').catch(() => {});
-                    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 12000 }).catch(() => {});
-                }
-
-                await sleep(2500);
-                await takeScreenshot(page, '08c-about-you-after-phone-retry');
-            }
-
-            newPageUrl = page.url();
-            console.log(`After about-you (post-phone) - URL: ${newPageUrl}`);
         }
 
         // Check if we're on the consent page

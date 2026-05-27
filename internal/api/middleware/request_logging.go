@@ -5,9 +5,12 @@ package middleware
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/tidwall/gjson"
 )
 
 const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
@@ -54,6 +58,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
+		wrapper.ginContext = c
 		if !loggerEnabled {
 			wrapper.logOnErrorOnly = true
 		}
@@ -165,7 +170,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		body = decodeCapturedRequestBodyForLog(bodyBytes, c.Request.Header.Get("Content-Encoding"))
 	}
 
-	return &RequestInfo{
+	requestInfo := &RequestInfo{
 		URL:       url,
 		Method:    method,
 		Headers:   headers,
@@ -173,7 +178,79 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		ClientIP:  clientIP,
 		RequestID: logging.GetGinRequestID(c),
 		Timestamp: time.Now(),
-	}, nil
+	}
+	appendRequestAttributionMetadata(c, requestInfo)
+	return requestInfo, nil
+}
+
+func appendRequestAttributionMetadata(c *gin.Context, info *RequestInfo) {
+	if c == nil || info == nil {
+		return
+	}
+	if info.Headers == nil {
+		info.Headers = make(map[string][]string)
+	}
+
+	meta := map[string]string{
+		requestMetaHeaderRemoteAddr:    strings.TrimSpace(c.Request.RemoteAddr),
+		requestMetaHeaderForwardedFor:  strings.TrimSpace(c.GetHeader("X-Forwarded-For")),
+		requestMetaHeaderRealIP:        strings.TrimSpace(c.GetHeader("X-Real-IP")),
+		requestMetaHeaderTrueClientIP:  strings.TrimSpace(c.GetHeader("True-Client-IP")),
+		requestMetaHeaderCFConnectingIP: strings.TrimSpace(c.GetHeader("CF-Connecting-IP")),
+		requestMetaHeaderForwarded:     strings.TrimSpace(c.GetHeader("Forwarded")),
+		requestMetaHeaderUserAgent:     strings.TrimSpace(c.GetHeader("User-Agent")),
+		requestMetaHeaderOrigin:        strings.TrimSpace(c.GetHeader("Origin")),
+		requestMetaHeaderReferer:       strings.TrimSpace(c.GetHeader("Referer")),
+	}
+	for key, value := range meta {
+		if value == "" {
+			continue
+		}
+		info.Headers[key] = []string{value}
+	}
+
+	apiKey := extractBearerToken(c.GetHeader("Authorization"))
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(c.GetHeader("X-API-Key"))
+	}
+	if apiKey != "" {
+		info.Headers[requestMetaHeaderAPIKeyFingerprint] = []string{fingerprintValue(apiKey)}
+	}
+
+	authorization := strings.TrimSpace(c.GetHeader("Authorization"))
+	if authorization != "" {
+		info.Headers[requestMetaHeaderAuthFingerprint] = []string{fingerprintValue(authorization)}
+	}
+
+	if len(info.Body) > 0 {
+		digest := sha256.Sum256(info.Body)
+		info.Headers[requestMetaHeaderRequestBodySHA256] = []string{hex.EncodeToString(digest[:])}
+		info.Headers[requestMetaHeaderRequestBodySize] = []string{strconv.Itoa(len(info.Body))}
+		if model := strings.TrimSpace(gjson.GetBytes(info.Body, "model").String()); model != "" {
+			info.Headers[requestMetaHeaderRequestedModel] = []string{model}
+		}
+	}
+}
+
+func extractBearerToken(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.SplitN(trimmed, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "Bearer") {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
+func fingerprintValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(digest[:8])
 }
 
 func decodeCapturedRequestBodyForLog(raw []byte, encoding string) []byte {

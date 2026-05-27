@@ -424,6 +424,7 @@ func (s *Server) setupRoutes() {
 	ollama.Use(AuthMiddleware(s.accessManager))
 	{
 		ollama.POST("/api/web_search", ollamaHandlers.WebSearch)
+		ollama.POST("/api/web_fetch", ollamaHandlers.WebFetch)
 	}
 
 	// Root endpoint
