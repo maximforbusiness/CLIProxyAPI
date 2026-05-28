@@ -61,6 +61,7 @@ const HERO_SMS_POLL_TIMEOUT_SEC = Math.max(30, parseInt(process.env.HERO_SMS_POL
 const HERO_SMS_POLL_INTERVAL_MS = Math.max(2000, parseInt(process.env.HERO_SMS_POLL_INTERVAL_MS || '3000', 10) || 3000);
 const HERO_SMS_MAX_COUNTRY_ATTEMPTS = Math.max(1, parseInt(process.env.HERO_SMS_MAX_COUNTRY_ATTEMPTS || '5', 10) || 5);
 const HERO_SMS_CANCEL_RETRY_DELAY_SEC = Math.max(30, parseInt(process.env.HERO_SMS_CANCEL_RETRY_DELAY_SEC || '180', 10) || 180);
+const HERO_SMS_API_KEY = String(process.env.HERO_SMS_API_KEY || '').trim();
 const HERO_SMS_MAX_PRICE = String(process.env.HERO_SMS_MAX_PRICE || '').trim();
 const SCREENSHOT_MODE = String(process.env.CODEX_SCREENSHOTS || 'off').trim().toLowerCase();
 const ENABLE_SCREENSHOTS = SCREENSHOT_MODE === '1' || SCREENSHOT_MODE === 'true' || SCREENSHOT_MODE === 'all';
@@ -836,8 +837,12 @@ async function heroSmsAcquireActivationFromPlan(acquirePlan) {
             if (Number.isFinite(envMaxPrice) && envMaxPrice > 0) {
                 params.maxPrice = envMaxPrice;
             } else if (candidate.hasPrice && candidate.cost > 0) {
-                // Add 80% margin over the listed price to survive dynamic pricing spikes
-                params.maxPrice = Math.round(candidate.cost * 1.8 * 1000) / 1000;
+                // Add 15% margin over the listed price to cover dynamic pricing drift
+                params.maxPrice = Math.round(candidate.cost * 1.15 * 1000) / 1000;
+            } else {
+                // No price info available (ranking off) — use a conservative default maxPrice
+                // that covers most OpenAI activations without overpaying
+                params.maxPrice = 0.1;
             }
 
             const raw = await heroSmsRequest(params);
@@ -948,37 +953,163 @@ async function fillInputValue(page, input, value) {
     }
 }
 
-async function selectSmsDeliveryMethod(page) {
+async function selectCountryInPhoneDropdown(page, countryName) {
+    // Select a country in the add-phone page country dropdown.
+    // Uses Puppeteer click() for proper React event handling.
     try {
-        const clicked = await page.evaluate(() => {
-            const isVisible = (el) => {
-                const st = window.getComputedStyle(el);
-                return st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
-            };
-            const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], label, a, div, span, input[type="radio"]'));
-            for (const el of nodes) {
-                if (!isVisible(el)) continue;
-                const text = (el.textContent || el.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                if (!text) continue;
-                // Skip anything mentioning WhatsApp
-                if (/whatsapp|what\s*app/.test(text)) continue;
-                // Match explicit SMS / Text message choices
-                if (/\bsms\b/.test(text) || /text message/.test(text) || /^text$/.test(text) || /send.*sms/.test(text)) {
-                    // Prefer the clickable wrapper if input is a radio
-                    const target = el.tagName.toLowerCase() === 'input' && el.type === 'radio'
-                        ? (el.closest('label') || el.closest('button') || el.closest('[role="tab"]') || el)
-                        : el;
-                    target.click();
-                    return text;
-                }
+        // Step 1: Click the country dropdown button to open it
+        const dropdownButton = await page.$('button[data-testid], button');
+        let opened = false;
+        const buttons = await page.$$('button');
+        for (const btn of buttons) {
+            const text = await page.evaluate(el => (el.textContent || '').replace(/\s+/g, ' ').trim(), btn);
+            if (/\(\+\d+\)/.test(text)) {
+                await btn.click();
+                console.log(`Opened country dropdown, current: ${text}`);
+                opened = true;
+                break;
             }
-            return null;
+        }
+        if (!opened) {
+            console.log('Could not find country dropdown button');
+            return false;
+        }
+        await sleep(800);
+
+        // Step 2: Find and click "Brazil" in the dropdown list
+        // The country list is rendered as a hidden <select> with <option> elements,
+        // with a custom React Aria UI overlay. We need to interact with the actual <option>.
+        const searchInput = await page.$('input[type="text"]');
+        if (searchInput) {
+            // Focus and type the country name to filter
+            await searchInput.click();
+            await searchInput.focus();
+            await page.keyboard.type(countryName, { delay: 50 });
+            console.log(`Typed "${countryName}" in country search`);
+            await sleep(800);
+
+            // Try to find the matching option element inside the hidden <select>
+            // React Aria Select uses <option> elements that we can select programmatically
+            const optionClicked = await page.evaluate((target) => {
+                const lc = target.toLowerCase();
+                // Find the hidden select
+                const select = document.querySelector('[data-testid="hidden-select-container"] select');
+                if (select) {
+                    const options = Array.from(select.options || []);
+                    for (const opt of options) {
+                        if ((opt.textContent || '').trim().toLowerCase() === lc) {
+                            // Select the option programmatically
+                            select.value = opt.value;
+                            select.dispatchEvent(new Event('change', { bubbles: true }));
+                            // Also trigger input event for React
+                            select.dispatchEvent(new Event('input', { bubbles: true }));
+                            return { method: 'select-change', value: opt.value, text: opt.textContent };
+                        }
+                    }
+                }
+
+                // Try clicking label elements that match
+                const labels = Array.from(document.querySelectorAll('label'));
+                for (const label of labels) {
+                    const text = (label.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (text.toLowerCase().startsWith(lc) && text.length < 50) {
+                        label.click();
+                        return { method: 'label-click', text };
+                    }
+                }
+
+                return null;
+            }, countryName);
+
+            if (optionClicked) {
+                console.log(`Selected country: ${JSON.stringify(optionClicked)}`);
+                await sleep(800);
+                return true;
+            }
+        }
+
+        console.log(`Could not find country "${countryName}" in dropdown`);
+        return false;
+    } catch (e) {
+        console.log(`selectCountryInPhoneDropdown error: ${e.message}`);
+        return false;
+    }
+}
+
+async function selectSmsDeliveryMethod(page) {
+    // Select SMS ("Text Message") instead of WhatsApp on the OpenAI add-phone page.
+    // The page has a radiogroup with aria-label="Send code via" containing two radio options:
+    //   - value="whatsapp" (left, selected by default for supported countries like Brazil)
+    //   - value="sms" (right, labeled "Text Message")
+    // We must click the SMS label BEFORE entering the phone number.
+    try {
+        // Wait for the radiogroup to appear (may need a moment after page render or country selection)
+        await page.waitForSelector('div[role="radiogroup"]', { timeout: 5000 }).catch(() => null);
+
+        const clicked = await page.evaluate(() => {
+            // Primary selector: the radiogroup "Send code via"
+            const radiogroup = document.querySelector('div[role="radiogroup"][aria-label="Send code via"]')
+                || document.querySelector('div[role="radiogroup"]');
+            if (!radiogroup) return null;
+
+            const smsRadio = radiogroup.querySelector('input[type="radio"][value="sms"]');
+            if (!smsRadio) return null;
+
+            // ALWAYS click the SMS label to ensure it's truly selected,
+            // even if data-state shows "on" — the visual state may be out of sync with the actual form value
+            const smsLabel = smsRadio.closest('label');
+            if (smsLabel) {
+                smsLabel.click();
+            } else {
+                smsRadio.click();
+            }
+
+            return { value: 'sms', labelDataState: smsLabel ? smsLabel.getAttribute('data-state') : null, radioChecked: smsRadio.checked };
         });
-        if (clicked) {
-            console.log(`Selected SMS delivery method: ${clicked}`);
-            await new Promise(r => setTimeout(r, 800));
+
+        if (!clicked) {
+            // No radiogroup on page — country may not support WhatsApp, SMS is default
+            console.log('No SMS/WhatsApp toggle found (SMS is likely default for this country)');
+            return;
+        }
+
+        console.log(`Clicked "Text Message" (SMS) option — label data-state=${clicked.labelDataState}, radio checked=${clicked.radioChecked}`);
+        await sleep(800);
+
+        // Verify: click again with radio directly if not checked
+        const recheck = await page.evaluate(() => {
+            const radiogroup = document.querySelector('div[role="radiogroup"][aria-label="Send code via"]')
+                || document.querySelector('div[role="radiogroup"]');
+            if (!radiogroup) return { checked: false };
+            const smsRadio = radiogroup.querySelector('input[type="radio"][value="sms"]');
+            const whatsappRadio = radiogroup.querySelector('input[type="radio"][value="whatsapp"]');
+            return {
+                smsChecked: smsRadio ? smsRadio.checked : null,
+                whatsappChecked: whatsappRadio ? whatsappRadio.checked : null,
+                smsDataState: smsRadio?.closest('label')?.getAttribute('data-state'),
+                whatsappDataState: whatsappRadio?.closest('label')?.getAttribute('data-state'),
+            };
+        });
+
+        console.log(`SMS verification: sms.checked=${recheck.smsChecked}, whatsapp.checked=${recheck.whatsappChecked}, sms data-state=${recheck.smsDataState}, whatsapp data-state=${recheck.whatsappDataState}`);
+
+        if (recheck.smsChecked) {
+            console.log('SMS delivery method confirmed ("Text Message" is now active)');
         } else {
-            console.log('No SMS/WhatsApp delivery toggle found on page (assuming SMS default)');
+            // Try clicking the radio input directly
+            console.log('SMS not checked yet, clicking radio input directly...');
+            await page.evaluate(() => {
+                const smsRadio = document.querySelector('div[role="radiogroup"] input[type="radio"][value="sms"]');
+                if (smsRadio) {
+                    smsRadio.click();
+                }
+            });
+            await sleep(300);
+            const final = await page.evaluate(() => {
+                const smsRadio = document.querySelector('div[role="radiogroup"] input[type="radio"][value="sms"]');
+                return smsRadio ? smsRadio.checked : null;
+            });
+            console.log(`After direct radio click: sms.checked=${final}`);
         }
     } catch (e) {
         console.log(`selectSmsDeliveryMethod error: ${e.message}`);
@@ -1059,9 +1190,86 @@ async function completePhoneVerificationWithHeroSMS(page) {
                 throw new Error('phone_input_not_found');
             }
 
+            // Select the country matching the phone number in the dropdown
+            // This ensures the SMS/WhatsApp radiogroup appears for WhatsApp-supported countries
+            const phoneForCountry = `+${activation.phone}`;
+            // Brazilian numbers start with +55, other common: +1 (US), +44 (UK), etc.
+            // Extract country code: try 2-digit first (covers BR=55, MX=52, etc.), then 1-digit
+            let countryMatch = phoneForCountry.match(/^\+(\d{2})/);
+            if (!countryMatch) countryMatch = phoneForCountry.match(/^\+(\d{1,3})/);
+            if (countryMatch) {
+                const countryCode = countryMatch[1];
+                const COUNTRY_NAMES_BY_CODE = {
+                    '1': 'United States', '7': 'Russia', '20': 'Egypt', '27': 'South Africa',
+                    '30': 'Greece', '31': 'Netherlands', '32': 'Belgium', '33': 'France',
+                    '34': 'Spain', '36': 'Hungary', '39': 'Italy', '40': 'Romania',
+                    '41': 'Switzerland', '43': 'Austria', '44': 'United Kingdom', '45': 'Denmark',
+                    '46': 'Sweden', '47': 'Norway', '48': 'Poland', '49': 'Germany',
+                    '51': 'Peru', '52': 'Mexico', '53': 'Cuba', '54': 'Argentina', '55': 'Brazil',
+                    '56': 'Chile', '57': 'Colombia', '58': 'Venezuela', '60': 'Malaysia',
+                    '61': 'Australia', '62': 'Indonesia', '63': 'Philippines', '64': 'New Zealand',
+                    '65': 'Singapore', '66': 'Thailand', '81': 'Japan', '82': 'South Korea',
+                    '84': 'Vietnam', '86': 'China', '90': 'Türkiye', '91': 'India',
+                    '92': 'Pakistan', '93': 'Afghanistan', '94': 'Sri Lanka', '95': 'Myanmar',
+                    '98': 'Iran', '212': 'Morocco', '213': 'Algeria', '216': 'Tunisia',
+                    '220': 'Gambia', '221': 'Senegal', '234': 'Nigeria', '254': 'Kenya',
+                    '255': 'Tanzania', '256': 'Uganda', '260': 'Zambia', '263': 'Zimbabwe',
+                    '265': 'Malawi', '266': 'Lesotho', '267': 'Botswana', '268': 'Eswatini',
+                    '351': 'Portugal', '352': 'Luxembourg', '353': 'Ireland', '354': 'Iceland',
+                    '355': 'Albania', '356': 'Malta', '357': 'Cyprus', '358': 'Finland',
+                    '359': 'Bulgaria', '370': 'Lithuania', '371': 'Latvia', '372': 'Estonia',
+                    '373': 'Moldova', '374': 'Armenia', '375': 'Belarus', '376': 'Andorra',
+                    '377': 'Monaco', '378': 'San Marino', '380': 'Ukraine', '381': 'Serbia',
+                    '382': 'Montenegro', '383': 'Kosovo', '385': 'Croatia', '386': 'Slovenia',
+                    '387': 'Bosnia', '389': 'North Macedonia', '420': 'Czechia', '421': 'Slovakia',
+                    '423': 'Liechtenstein', '501': 'Belize', '502': 'Guatemala', '503': 'El Salvador',
+                    '504': 'Honduras', '505': 'Nicaragua', '506': 'Costa Rica', '507': 'Panama',
+                    '508': 'Saint Pierre', '509': 'Haiti', '590': 'Guadeloupe', '591': 'Bolivia',
+                    '592': 'Guyana', '593': 'Ecuador', '594': 'French Guiana', '595': 'Paraguay',
+                    '596': 'Martinique', '597': 'Suriname', '598': 'Uruguay', '599': 'Curaçao',
+                    '670': 'Timor-Leste', '672': 'Antarctica', '673': 'Brunei', '674': 'Nauru',
+                    '675': 'Papua New Guinea', '676': 'Tonga', '677': 'Solomon Islands',
+                    '678': 'Vanuatu', '679': 'Fiji', '680': 'Palau', '681': 'Wallis',
+                    '682': 'Cook Islands', '683': 'Niue', '685': 'Samoa', '686': 'Kiribati',
+                    '687': 'New Caledonia', '688': 'Tuvalu', '689': 'French Polynesia',
+                    '690': 'Tokelau', '691': 'Micronesia', '692': 'Marshall Islands',
+                    '850': 'North Korea', '852': 'Hong Kong', '853': 'Macao', '855': 'Cambodia',
+                    '856': 'Laos', '880': 'Bangladesh', '886': 'Taiwan', '960': 'Maldives',
+                    '961': 'Lebanon', '962': 'Jordan', '963': 'Syria', '964': 'Iraq',
+                    '965': 'Kuwait', '966': 'Saudi Arabia', '967': 'Yemen', '968': 'Oman',
+                    '970': 'Palestine', '971': 'United Arab Emirates', '972': 'Israel',
+                    '973': 'Bahrain', '974': 'Qatar', '975': 'Bhutan', '976': 'Mongolia',
+                    '977': 'Nepal', '992': 'Tajikistan', '993': 'Turkmenistan', '994': 'Azerbaijan',
+                    '995': 'Georgia', '996': 'Kyrgyzstan', '998': 'Uzbekistan',
+                };
+                const countryName = COUNTRY_NAMES_BY_CODE[countryCode];
+                if (countryName) {
+                    const selected = await selectCountryInPhoneDropdown(page, countryName);
+                    if (selected) {
+                        // After country selection, the SMS/WhatsApp radiogroup may appear
+                        await sleep(1000);
+                    }
+                } else {
+                    console.log(`No country name mapping for phone code +${countryCode}, skipping country dropdown selection`);
+                }
+            }
+
             await selectSmsDeliveryMethod(page);
 
-            const phoneCandidates = [`+${activation.phone}`, activation.phone];
+            // Build phone number candidates.
+            // If a country was selected in the dropdown, the input field already includes the country prefix,
+            // so we must enter only the local number (without the country code) to avoid duplication.
+            // e.g. for Brazil (+55), activation.phone=5568984180503 → enter 68984180503
+            const rawPhone = String(activation.phone || '');
+            let localPhone = rawPhone;
+            if (countryMatch) {
+                const cc = countryMatch[1];
+                if (rawPhone.startsWith(cc)) {
+                    localPhone = rawPhone.slice(cc.length);
+                }
+            }
+            const phoneCandidates = [localPhone, `+${rawPhone}`, rawPhone];
+            console.log(`Phone candidates (raw=${rawPhone}, country code selected=${countryMatch ? countryMatch[1] : 'none'}, local=${localPhone}): ${phoneCandidates.join(', ')}`);
             let codeInputResult = null;
             let deliveryMode = 'unknown';
 
@@ -1682,6 +1890,14 @@ async function performLogin(authUrl) {
                 localRedirectUrl = url;
                 console.log(`[REQUEST] Local redirect without code: ${url}`);
             }
+
+            if (url.includes('/api/accounts/create_account')) {
+                const method = request.method();
+                let payload = '';
+                try { payload = request.postData() || ''; } catch (_) {}
+                console.log(`[DEBUG create_account request] method=${method} payload=${payload}`);
+            }
+
             lastUrl = url;
         });
         
@@ -1693,6 +1909,12 @@ async function performLogin(authUrl) {
                 const headers = response.headers();
                 const contentType = headers['content-type'] || headers['Content-Type'] || '';
                 console.log(`[HTTP ${status}] ${url} content-type=${contentType}`);
+                if (url.includes('/api/accounts/create_account')) {
+                    response.text().then((body) => {
+                        const shortBody = String(body || '').replace(/\s+/g, ' ').slice(0, 1200);
+                        console.log(`[DEBUG create_account response] status=${status} body=${shortBody}`);
+                    }).catch(() => {});
+                }
             }
             if (url.includes('/api/accounts/password/verify') && status === 401) {
                 passwordVerifyRejected = true;
@@ -2309,9 +2531,11 @@ async function performLogin(authUrl) {
             console.log(`After about-you - URL: ${newPageUrl}`);
         }
 
-        if (newPageUrl.includes('add-phone')) {
+            if (newPageUrl.includes('add-phone')) {
             console.log('Phone number required by OpenAI. Attempting Hero-SMS activation flow...');
             const phoneResult = await completePhoneVerificationWithHeroSMS(page);
+
+
             if (!phoneResult.success) {
                 return { success: false, reason: phoneResult.reason || 'phone_required' };
             }
@@ -2339,18 +2563,41 @@ async function performLogin(authUrl) {
             const dobISO = `${birthYear}-${String(birthMonth).padStart(2, '0')}-${String(birthDay).padStart(2, '0')}`;
             const dobDisplay = `${String(birthMonth).padStart(2, '0')}/${String(birthDay).padStart(2, '0')}/${birthYear}`;
 
-            const nameInput = await page.$('input[name*="name" i], input[placeholder*="name" i], input[aria-label*="name" i]');
+            const aboutFields = await page.evaluate(() => {
+                const vis = (el) => {
+                    const st = window.getComputedStyle(el);
+                    return st.display !== 'none' && st.visibility !== 'hidden';
+                };
+                return Array.from(document.querySelectorAll('input, textarea, select'))
+                    .filter(vis)
+                    .map((el, idx) => ({
+                        idx,
+                        tag: el.tagName.toLowerCase(),
+                        type: (el.type || '').toLowerCase(),
+                        name: el.name || '',
+                        id: el.id || '',
+                        placeholder: el.placeholder || '',
+                        aria: el.getAttribute('aria-label') || ''
+                    }));
+            }).catch(() => []);
+            console.log('About-you post-phone visible fields:', JSON.stringify(aboutFields));
+
+            const nameInput = await page.$('input[name*="name" i], input[id*="name" i], input[placeholder*="name" i], input[aria-label*="name" i]');
             if (nameInput) {
+                console.log('Post-phone about-you: entering NAME first');
                 await fillInputValue(page, nameInput, fullName);
             }
 
-            const ageDobInput = await page.$('input[name*="birth" i], input[id*="birth" i], input[placeholder*="birth" i], input[aria-label*="birth" i], input[placeholder*="age" i], input[aria-label*="age" i], input[autocomplete="bday"], input[type="date"]');
-            if (ageDobInput) {
-                const isAgePrompt = await page.evaluate((el) => {
-                    const ctx = `${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''} ${el.name || ''} ${el.id || ''}`.toLowerCase();
-                    return /age/.test(ctx) && !/birth|date|dob/.test(ctx);
-                }, ageDobInput).catch(() => false);
-                await fillInputValue(page, ageDobInput, isAgePrompt ? ageValue : dobDisplay);
+            const ageInput = await page.$('input[name*="age" i], input[id*="age" i], input[placeholder*="age" i], input[aria-label*="age" i]');
+            if (ageInput) {
+                console.log('Post-phone about-you: entering AGE second');
+                await fillInputValue(page, ageInput, ageValue);
+            } else {
+                const ageDobInput = await page.$('input[name*="birth" i], input[id*="birth" i], input[placeholder*="birth" i], input[aria-label*="birth" i], input[autocomplete="bday"], input[type="date"]');
+                if (ageDobInput) {
+                    console.log('Post-phone about-you: birthday-style field detected');
+                    await fillInputValue(page, ageDobInput, dobDisplay);
+                }
             }
 
             const hiddenBirthdayInput = await page.$('input[name="birthday"]');
