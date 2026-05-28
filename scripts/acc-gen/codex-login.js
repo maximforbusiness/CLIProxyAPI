@@ -61,7 +61,7 @@ const HERO_SMS_POLL_TIMEOUT_SEC = Math.max(30, parseInt(process.env.HERO_SMS_POL
 const HERO_SMS_POLL_INTERVAL_MS = Math.max(2000, parseInt(process.env.HERO_SMS_POLL_INTERVAL_MS || '3000', 10) || 3000);
 const HERO_SMS_MAX_COUNTRY_ATTEMPTS = Math.max(1, parseInt(process.env.HERO_SMS_MAX_COUNTRY_ATTEMPTS || '5', 10) || 5);
 const HERO_SMS_CANCEL_RETRY_DELAY_SEC = Math.max(30, parseInt(process.env.HERO_SMS_CANCEL_RETRY_DELAY_SEC || '180', 10) || 180);
-const HERO_SMS_API_KEY = String(process.env.HERO_SMS_API_KEY || '').trim();
+const HERO_SMS_MAX_PRICE = String(process.env.HERO_SMS_MAX_PRICE || '').trim();
 const SCREENSHOT_MODE = String(process.env.CODEX_SCREENSHOTS || 'off').trim().toLowerCase();
 const ENABLE_SCREENSHOTS = SCREENSHOT_MODE === '1' || SCREENSHOT_MODE === 'true' || SCREENSHOT_MODE === 'all';
 const AUTH_PAGE_NAV_TIMEOUT_MS = Math.max(15000, parseInt(process.env.CODEX_AUTH_PAGE_NAV_TIMEOUT_MS || '35000', 10) || 35000);
@@ -825,11 +825,22 @@ async function heroSmsAcquireActivationFromPlan(acquirePlan) {
         const service = candidate.service;
 
         for (let attempt = 1; attempt <= perCandidateRetries; attempt++) {
-            const raw = await heroSmsRequest({
+            const params = {
                 action: 'getNumber',
                 service,
                 country
-            });
+            };
+
+            // Apply maxPrice: explicit env override wins, otherwise derive from candidate price with margin
+            const envMaxPrice = parseFloat(HERO_SMS_MAX_PRICE);
+            if (Number.isFinite(envMaxPrice) && envMaxPrice > 0) {
+                params.maxPrice = envMaxPrice;
+            } else if (candidate.hasPrice && candidate.cost > 0) {
+                // Add 80% margin over the listed price to survive dynamic pricing spikes
+                params.maxPrice = Math.round(candidate.cost * 1.8 * 1000) / 1000;
+            }
+
+            const raw = await heroSmsRequest(params);
 
             const activation = parseHeroActivation(raw);
             if (activation && activation.id && activation.phone) {
