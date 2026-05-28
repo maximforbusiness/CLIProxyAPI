@@ -53,7 +53,7 @@ const HERO_SMS_SERVICES = String(process.env.HERO_SMS_SERVICES || '')
 const HERO_SMS_SERVICE_PREFIX = String(process.env.HERO_SMS_SERVICE_PREFIX || '').trim().toLowerCase();
 const HERO_SMS_SERVICE_QUERY = String(process.env.HERO_SMS_SERVICE_QUERY || 'open').trim().toLowerCase();
 const HERO_SMS_PRICE_RANKING = String(process.env.HERO_SMS_PRICE_RANKING || 'off').trim().toLowerCase();
-const HERO_SMS_COUNTRIES = String(process.env.HERO_SMS_COUNTRIES || '52,151,15,46,32')
+const HERO_SMS_COUNTRIES = String(process.env.HERO_SMS_COUNTRIES || '73')
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean);
@@ -937,6 +937,43 @@ async function fillInputValue(page, input, value) {
     }
 }
 
+async function selectSmsDeliveryMethod(page) {
+    try {
+        const clicked = await page.evaluate(() => {
+            const isVisible = (el) => {
+                const st = window.getComputedStyle(el);
+                return st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
+            };
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], label, a, div, span, input[type="radio"]'));
+            for (const el of nodes) {
+                if (!isVisible(el)) continue;
+                const text = (el.textContent || el.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                if (!text) continue;
+                // Skip anything mentioning WhatsApp
+                if (/whatsapp|what\s*app/.test(text)) continue;
+                // Match explicit SMS / Text message choices
+                if (/\bsms\b/.test(text) || /text message/.test(text) || /^text$/.test(text) || /send.*sms/.test(text)) {
+                    // Prefer the clickable wrapper if input is a radio
+                    const target = el.tagName.toLowerCase() === 'input' && el.type === 'radio'
+                        ? (el.closest('label') || el.closest('button') || el.closest('[role="tab"]') || el)
+                        : el;
+                    target.click();
+                    return text;
+                }
+            }
+            return null;
+        });
+        if (clicked) {
+            console.log(`Selected SMS delivery method: ${clicked}`);
+            await new Promise(r => setTimeout(r, 800));
+        } else {
+            console.log('No SMS/WhatsApp delivery toggle found on page (assuming SMS default)');
+        }
+    } catch (e) {
+        console.log(`selectSmsDeliveryMethod error: ${e.message}`);
+    }
+}
+
 async function completePhoneVerificationWithHeroSMS(page) {
     if (!HERO_SMS_API_KEY) {
         return { success: false, reason: 'phone_required_hero_sms_api_key_missing' };
@@ -1010,6 +1047,8 @@ async function completePhoneVerificationWithHeroSMS(page) {
             if (!phoneInputResult || !phoneInputResult.handle) {
                 throw new Error('phone_input_not_found');
             }
+
+            await selectSmsDeliveryMethod(page);
 
             const phoneCandidates = [`+${activation.phone}`, activation.phone];
             let codeInputResult = null;
