@@ -1289,6 +1289,12 @@ for ((idx=START_INDEX; idx<END_INDEX; idx++)); do
     ATTEMPT_LIMIT=1
     if [ "$PROXY_COUNT" -gt 0 ]; then
         ATTEMPT_LIMIT="$MAX_PROXY_ATTEMPTS"
+        # For SMS-gated signup runs, we need enough proxy rotation to find an IP
+        # where OpenAI renders the SMS/WhatsApp channel selector.
+        if [ "$FORCE_SIGNUP" = true ] && [ "$ATTEMPT_LIMIT" -lt 3 ] && [ "$PROXY_COUNT" -ge 3 ]; then
+            ATTEMPT_LIMIT=3
+            echo "Proxy attempts raised to 3 for signup SMS-gate discovery"
+        fi
         if [ "$ATTEMPT_LIMIT" -gt "$PROXY_COUNT" ]; then
             ATTEMPT_LIMIT="$PROXY_COUNT"
         fi
@@ -1391,6 +1397,31 @@ for ((idx=START_INDEX; idx<END_INDEX; idx++)); do
         fi
         if [ -n "$SMS_PRICE_RANKING" ]; then
             NODE_ENV_ARGS+=("HERO_SMS_PRICE_RANKING=$SMS_PRICE_RANKING")
+        fi
+        # Hero-SMS credentials & tuning
+        if [ -n "${HERO_SMS_API_KEY:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_API_KEY=$HERO_SMS_API_KEY")
+        fi
+        if [ -n "${HERO_SMS_BASE_URL:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_BASE_URL=$HERO_SMS_BASE_URL")
+        fi
+        if [ -n "${HERO_SMS_COUNTRIES:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_COUNTRIES=$HERO_SMS_COUNTRIES")
+        fi
+        if [ -n "${HERO_SMS_MAX_PRICE:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_MAX_PRICE=$HERO_SMS_MAX_PRICE")
+        fi
+        if [ -n "${HERO_SMS_POLL_TIMEOUT_SEC:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_POLL_TIMEOUT_SEC=$HERO_SMS_POLL_TIMEOUT_SEC")
+        fi
+        if [ -n "${HERO_SMS_POLL_INTERVAL_MS:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_POLL_INTERVAL_MS=$HERO_SMS_POLL_INTERVAL_MS")
+        fi
+        if [ -n "${HERO_SMS_MAX_COUNTRY_ATTEMPTS:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_MAX_COUNTRY_ATTEMPTS=$HERO_SMS_MAX_COUNTRY_ATTEMPTS")
+        fi
+        if [ -n "${HERO_SMS_CANCEL_RETRY_DELAY_SEC:-}" ]; then
+            NODE_ENV_ARGS+=("HERO_SMS_CANCEL_RETRY_DELAY_SEC=$HERO_SMS_CANCEL_RETRY_DELAY_SEC")
         fi
         if [ "$FORCE_SIGNUP" = true ]; then
             NODE_ENV_ARGS+=("CODEX_ENABLE_SIGNUP_FLOW=1")
@@ -1541,6 +1572,9 @@ for ((idx=START_INDEX; idx<END_INDEX; idx++)); do
         else
             echo "✗ Failed to get callback URL for account #$idx (attempt $((attempt + 1)), exit=$LOGIN_EXIT, reason=${RESULT_REASON:-unknown})"
             state_update_account "$ACCOUNT_EMAIL" "failed" "$ACCOUNT_REASON" "$idx" "$((attempt + 1))" "$SELECTED_PROXY" ""
+            if [ "$ACCOUNT_REASON" = "sms_gate_not_confirmed" ]; then
+                echo "↻ SMS gate not confirmed on this proxy; rotating to next proxy..."
+            fi
         fi
 
         ensure_clean_auth_env

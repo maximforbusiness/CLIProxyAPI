@@ -44,6 +44,7 @@ const VIEWPORTS = [
 ];
 
 const BROWSER_ENGINE = normalizeBrowserEngine(process.env.CODEX_BROWSER_ENGINE || 'auto');
+const CODEX_LEAN_REQUESTS = String(process.env.CODEX_LEAN_REQUESTS || '1').trim().toLowerCase();
 const HERO_SMS_BASE_URL = process.env.HERO_SMS_BASE_URL || 'https://hero-sms.com/stubs/handler_api.php';
 const HERO_SMS_SERVICE = (process.env.HERO_SMS_SERVICE || 'dr').trim();
 const HERO_SMS_SERVICES = String(process.env.HERO_SMS_SERVICES || '')
@@ -954,13 +955,14 @@ async function fillInputValue(page, input, value) {
 }
 
 async function selectCountryInPhoneDropdown(page, countryName) {
-    // Select a country in the add-phone page country dropdown.
-    // Uses Puppeteer click() for proper React event handling.
+    // Select a country by opening the dropdown UI and clicking the matching label.
+    // React Aria Select renders labels for each country option when dropdown is open.
+    // We must interact through the UI (not programmatically) to trigger full React re-rendering
+    // including the SMS/WhatsApp radiogroup.
     try {
         // Step 1: Click the country dropdown button to open it
-        const dropdownButton = await page.$('button[data-testid], button');
-        let opened = false;
         const buttons = await page.$$('button');
+        let opened = false;
         for (const btn of buttons) {
             const text = await page.evaluate(el => (el.textContent || '').replace(/\s+/g, ' ').trim(), btn);
             if (/\(\+\d+\)/.test(text)) {
@@ -974,61 +976,99 @@ async function selectCountryInPhoneDropdown(page, countryName) {
             console.log('Could not find country dropdown button');
             return false;
         }
-        await sleep(800);
+        await sleep(500);
 
-        // Step 2: Find and click "Brazil" in the dropdown list
-        // The country list is rendered as a hidden <select> with <option> elements,
-        // with a custom React Aria UI overlay. We need to interact with the actual <option>.
-        const searchInput = await page.$('input[type="text"]');
-        if (searchInput) {
-            // Focus and type the country name to filter
-            await searchInput.click();
-            await searchInput.focus();
-            await page.keyboard.type(countryName, { delay: 50 });
-            console.log(`Typed "${countryName}" in country search`);
-            await sleep(800);
+        // Step 2: Type the country name to filter options in the React Aria ListBox
+        // The search/filter input receives keyboard events when the listbox is focused
+        await page.keyboard.type(countryName, { delay: 40 });
+        console.log(`Typed "${countryName}" in dropdown`);
+        await sleep(600);
 
-            // Try to find the matching option element inside the hidden <select>
-            // React Aria Select uses <option> elements that we can select programmatically
-            const optionClicked = await page.evaluate((target) => {
-                const lc = target.toLowerCase();
-                // Find the hidden select
-                const select = document.querySelector('[data-testid="hidden-select-container"] select');
-                if (select) {
-                    const options = Array.from(select.options || []);
+        // Step 3: After typing to filter, use Puppeteer to find and click the Brazil option
+        // in the visible dropdown list. The dropdown shows countries as label elements.
+        // We need to scroll to find "Brazil" and click it.
+        const countryFound = await page.evaluate((target) => {
+            const lc = target.toLowerCase();
+            // The React Aria ListBox may render options as labels or divs with role="option"
+            // Try finding visible options
+            const options = Array.from(document.querySelectorAll('[role="option"], [data-key]'));
+            for (const opt of options) {
+                const text = (opt.textContent || '').trim().toLowerCase();
+                if (text.includes(lc)) {
+                    opt.scrollIntoView({ block: 'center' });
+                    return { method: 'option-scroll', tag: opt.tagName, text: opt.textContent.slice(0, 60) };
+                }
+            }
+            // Try labels with for attribute matching an option
+            const labels = Array.from(document.querySelectorAll('label[for]'));
+            for (const label of labels) {
+                const text = (label.textContent || '').trim().toLowerCase();
+                if (text === lc || (text.startsWith(lc) && text.length < lc.length + 20)) {
+                    label.scrollIntoView({ block: 'center' });
+                    return { method: 'label-scroll', tag: label.tagName, text: label.textContent.slice(0, 60) };
+                }
+            }
+            return null;
+        }, countryName);
+
+        console.log(`Country search result: ${JSON.stringify(countryFound)}`);
+
+        if (countryFound) {
+            // Click on the found element via Puppeteer element handle (proper Chromium click)
+            // Find the option with text matching countryName
+            const optionHandles = await page.$$('[role="option"], [data-key]');
+            let clickedOption = false;
+            for (const handle of optionHandles) {
+                const text = await page.evaluate(el => (el.textContent || '').trim(), handle);
+                if (text.toLowerCase().includes(countryName.toLowerCase())) {
+                    await handle.click();
+                    clickedOption = true;
+                    console.log(`Clicked [role=option] handle: ${text.slice(0, 60)}`);
+                    break;
+                }
+            }
+            if (!clickedOption) {
+                console.log('Could not click option handle, trying evaluate click');
+                await page.evaluate((target) => {
+                    const lc = target.toLowerCase();
+                    const options = Array.from(document.querySelectorAll('[role="option"], [data-key]'));
                     for (const opt of options) {
-                        if ((opt.textContent || '').trim().toLowerCase() === lc) {
-                            // Select the option programmatically
-                            select.value = opt.value;
-                            select.dispatchEvent(new Event('change', { bubbles: true }));
-                            // Also trigger input event for React
-                            select.dispatchEvent(new Event('input', { bubbles: true }));
-                            return { method: 'select-change', value: opt.value, text: opt.textContent };
+                        if ((opt.textContent || '').trim().toLowerCase().includes(lc)) {
+                            opt.click();
+                            return true;
                         }
                     }
-                }
-
-                // Try clicking label elements that match
-                const labels = Array.from(document.querySelectorAll('label'));
-                for (const label of labels) {
-                    const text = (label.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (text.toLowerCase().startsWith(lc) && text.length < 50) {
-                        label.click();
-                        return { method: 'label-click', text };
-                    }
-                }
-
-                return null;
-            }, countryName);
-
-            if (optionClicked) {
-                console.log(`Selected country: ${JSON.stringify(optionClicked)}`);
-                await sleep(800);
-                return true;
+                    return false;
+                }, countryName);
             }
+            await sleep(800);
+            await page.keyboard.press('Escape').catch(() => {});
+            await sleep(300);
+            return true;
         }
 
-        console.log(`Could not find country "${countryName}" in dropdown`);
+        // Fallback: Use ArrowDown/ArrowUp keyboard nav from top of list to find Brazil
+        // Go to top of list first (Home key), then ArrowDown to find Brazil
+        console.log('Trying keyboard navigation fallback');
+        await page.keyboard.press('Home');
+        await sleep(100);
+        for (let i = 0; i < 300; i++) {
+            // Check what's currently highlighted
+            const current = await page.evaluate(() => {
+                const opt = document.querySelector('[role="option"][aria-selected="true"], [data-focused="true"]');
+                return opt ? (opt.textContent || '').trim().slice(0, 40) : null;
+            });
+            if (current && current.toLowerCase().includes(countryName.toLowerCase())) {
+                await page.keyboard.press('Enter');
+                console.log(`Selected ${countryName} via keyboard nav at index ${i}`);
+                await sleep(500);
+                return true;
+            }
+            await page.keyboard.press('ArrowDown');
+            await sleep(20);
+        }
+
+        console.log(`Could not find ${countryName} in dropdown`);
         return false;
     } catch (e) {
         console.log(`selectCountryInPhoneDropdown error: ${e.message}`);
@@ -1044,7 +1084,35 @@ async function selectSmsDeliveryMethod(page) {
     // We must click the SMS label BEFORE entering the phone number.
     try {
         // Wait for the radiogroup to appear (may need a moment after page render or country selection)
-        await page.waitForSelector('div[role="radiogroup"]', { timeout: 5000 }).catch(() => null);
+        // Try multiple times with increasing delay in case React Aria updates asynchronously
+        let foundRadiogroup = false;
+        for (let wait = 0; wait < 5; wait++) {
+            foundRadiogroup = await page.evaluate(() => !!document.querySelector('div[role="radiogroup"]'));
+            if (foundRadiogroup) break;
+            await sleep(1000);
+        }
+        if (!foundRadiogroup) {
+            // Log what IS in the DOM for debugging
+            const debugInfo = await page.evaluate(() => {
+                const inputs = Array.from(document.querySelectorAll('input')); 
+                const channel = document.querySelector('input[name="channel"]');
+                return {
+                    inputCount: inputs.length,
+                    inputTypes: inputs.map(i => `${i.type}:${i.name}=${i.value}`).slice(0, 10),
+                    channelPresent: !!channel,
+                    channelValue: channel ? channel.value : null,
+                    bodyText: (document.body.innerText || '').slice(0, 300),
+                };
+            });
+            console.log(`No radiogroup found. Debug: inputs=${debugInfo.inputCount}, channel=${debugInfo.channelPresent}=${debugInfo.channelValue}, text=${debugInfo.bodyText.slice(0, 200)}`);
+            // If channel=sms hidden input exists, SMS is already the selected delivery method
+            if (debugInfo.channelValue === 'sms') {
+                console.log('channel=sms hidden input found - SMS is selected by default, no toggle needed');
+                return;
+            }
+            console.log('No SMS/WhatsApp toggle found (SMS is likely default for this country)');
+            return;
+        }
 
         const clicked = await page.evaluate(() => {
             // Primary selector: the radiogroup "Send code via"
@@ -1171,6 +1239,90 @@ async function completePhoneVerificationWithHeroSMS(page) {
         return await waitForAnySelector(page, phoneInputSelectors, 6000);
     }
 
+    async function ensureSmsReadyBeforeAcquire() {
+        // HARD GATE: do not request paid phone numbers until SMS path is confirmed in UI.
+        const smsState = await page.evaluate(() => {
+            const radioGroup = document.querySelector('div[role="radiogroup"][aria-label="Send code via"], div[role="radiogroup"]');
+            const smsRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="sms"]') : null;
+            const waRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="whatsapp"]') : null;
+            const channelInput = document.querySelector('input[name="channel"]');
+            return {
+                hasRadioGroup: !!radioGroup,
+                hasSmsRadio: !!smsRadio,
+                smsChecked: !!(smsRadio && smsRadio.checked),
+                whatsappChecked: !!(waRadio && waRadio.checked),
+                hasChannelInput: !!channelInput,
+                channelValue: channelInput ? String(channelInput.value || '').toLowerCase() : '',
+                preview: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 500)
+            };
+        }).catch(() => null);
+
+        if (!smsState) return { ok: false, reason: 'sms_gate_dom_eval_failed' };
+
+        // Debug dump for investigating missing SMS toggle
+        try {
+            const fullDump = await page.evaluate(() => ({
+                url: location.href,
+                title: document.title,
+                text: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 8000),
+                html: (document.body && document.body.innerHTML ? document.body.innerHTML : '').slice(0, 120000),
+                interactives: Array.from(document.querySelectorAll('input, button, label, [role], [data-testid], [aria-label]')).map(el => ({
+                    tag: el.tagName,
+                    type: el.type || '',
+                    name: el.name || '',
+                    value: el.value || '',
+                    role: el.getAttribute('role') || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    dataTestId: el.getAttribute('data-testid') || '',
+                    dataState: el.getAttribute('data-state') || '',
+                    text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                    checked: !!el.checked,
+                }))
+            }));
+            require('fs').writeFileSync('/tmp/add-phone-sms-gate-debug.json', JSON.stringify(fullDump, null, 2));
+            console.log('SMS gate debug dump saved: /tmp/add-phone-sms-gate-debug.json');
+        } catch (e) {
+            console.log(`SMS gate debug dump failed: ${e.message}`);
+        }
+
+        // Try selecting SMS once more before final decision
+        await selectSmsDeliveryMethod(page).catch(() => {});
+
+        const smsStateAfter = await page.evaluate(() => {
+            const radioGroup = document.querySelector('div[role="radiogroup"][aria-label="Send code via"], div[role="radiogroup"]');
+            const smsRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="sms"]') : null;
+            const waRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="whatsapp"]') : null;
+            const channelInput = document.querySelector('input[name="channel"]');
+            return {
+                hasRadioGroup: !!radioGroup,
+                hasSmsRadio: !!smsRadio,
+                smsChecked: !!(smsRadio && smsRadio.checked),
+                whatsappChecked: !!(waRadio && waRadio.checked),
+                hasChannelInput: !!channelInput,
+                channelValue: channelInput ? String(channelInput.value || '').toLowerCase() : '',
+            };
+        }).catch(() => null);
+
+        if (!smsStateAfter) return { ok: false, reason: 'sms_gate_postcheck_failed' };
+
+        const smsExplicit = smsStateAfter.hasRadioGroup && smsStateAfter.hasSmsRadio && smsStateAfter.smsChecked && !smsStateAfter.whatsappChecked;
+        const smsViaHiddenChannel = smsStateAfter.hasChannelInput && smsStateAfter.channelValue === 'sms';
+
+        if (smsExplicit || smsViaHiddenChannel) {
+            console.log(`SMS gate passed: explicit=${smsExplicit}, hiddenChannelSms=${smsViaHiddenChannel}`);
+            return { ok: true };
+        }
+
+        console.log(`SMS gate failed: hasRadioGroup=${smsStateAfter.hasRadioGroup}, hasSmsRadio=${smsStateAfter.hasSmsRadio}, smsChecked=${smsStateAfter.smsChecked}, whatsappChecked=${smsStateAfter.whatsappChecked}, channel=${smsStateAfter.channelValue}`);
+        return { ok: false, reason: 'sms_gate_not_confirmed' };
+    }
+
+    // HARD GATE before any paid activation request
+    const smsGate = await ensureSmsReadyBeforeAcquire();
+    if (!smsGate.ok) {
+        return { success: false, reason: smsGate.reason || 'sms_gate_failed' };
+    }
+
     for (let countryAttempt = 0; countryAttempt < countryRetryPlan.length; countryAttempt++) {
         const countryCandidate = countryRetryPlan[countryAttempt];
         const country = countryCandidate.country;
@@ -1190,86 +1342,15 @@ async function completePhoneVerificationWithHeroSMS(page) {
                 throw new Error('phone_input_not_found');
             }
 
-            // Select the country matching the phone number in the dropdown
-            // This ensures the SMS/WhatsApp radiogroup appears for WhatsApp-supported countries
-            const phoneForCountry = `+${activation.phone}`;
-            // Brazilian numbers start with +55, other common: +1 (US), +44 (UK), etc.
-            // Extract country code: try 2-digit first (covers BR=55, MX=52, etc.), then 1-digit
-            let countryMatch = phoneForCountry.match(/^\+(\d{2})/);
-            if (!countryMatch) countryMatch = phoneForCountry.match(/^\+(\d{1,3})/);
-            if (countryMatch) {
-                const countryCode = countryMatch[1];
-                const COUNTRY_NAMES_BY_CODE = {
-                    '1': 'United States', '7': 'Russia', '20': 'Egypt', '27': 'South Africa',
-                    '30': 'Greece', '31': 'Netherlands', '32': 'Belgium', '33': 'France',
-                    '34': 'Spain', '36': 'Hungary', '39': 'Italy', '40': 'Romania',
-                    '41': 'Switzerland', '43': 'Austria', '44': 'United Kingdom', '45': 'Denmark',
-                    '46': 'Sweden', '47': 'Norway', '48': 'Poland', '49': 'Germany',
-                    '51': 'Peru', '52': 'Mexico', '53': 'Cuba', '54': 'Argentina', '55': 'Brazil',
-                    '56': 'Chile', '57': 'Colombia', '58': 'Venezuela', '60': 'Malaysia',
-                    '61': 'Australia', '62': 'Indonesia', '63': 'Philippines', '64': 'New Zealand',
-                    '65': 'Singapore', '66': 'Thailand', '81': 'Japan', '82': 'South Korea',
-                    '84': 'Vietnam', '86': 'China', '90': 'Türkiye', '91': 'India',
-                    '92': 'Pakistan', '93': 'Afghanistan', '94': 'Sri Lanka', '95': 'Myanmar',
-                    '98': 'Iran', '212': 'Morocco', '213': 'Algeria', '216': 'Tunisia',
-                    '220': 'Gambia', '221': 'Senegal', '234': 'Nigeria', '254': 'Kenya',
-                    '255': 'Tanzania', '256': 'Uganda', '260': 'Zambia', '263': 'Zimbabwe',
-                    '265': 'Malawi', '266': 'Lesotho', '267': 'Botswana', '268': 'Eswatini',
-                    '351': 'Portugal', '352': 'Luxembourg', '353': 'Ireland', '354': 'Iceland',
-                    '355': 'Albania', '356': 'Malta', '357': 'Cyprus', '358': 'Finland',
-                    '359': 'Bulgaria', '370': 'Lithuania', '371': 'Latvia', '372': 'Estonia',
-                    '373': 'Moldova', '374': 'Armenia', '375': 'Belarus', '376': 'Andorra',
-                    '377': 'Monaco', '378': 'San Marino', '380': 'Ukraine', '381': 'Serbia',
-                    '382': 'Montenegro', '383': 'Kosovo', '385': 'Croatia', '386': 'Slovenia',
-                    '387': 'Bosnia', '389': 'North Macedonia', '420': 'Czechia', '421': 'Slovakia',
-                    '423': 'Liechtenstein', '501': 'Belize', '502': 'Guatemala', '503': 'El Salvador',
-                    '504': 'Honduras', '505': 'Nicaragua', '506': 'Costa Rica', '507': 'Panama',
-                    '508': 'Saint Pierre', '509': 'Haiti', '590': 'Guadeloupe', '591': 'Bolivia',
-                    '592': 'Guyana', '593': 'Ecuador', '594': 'French Guiana', '595': 'Paraguay',
-                    '596': 'Martinique', '597': 'Suriname', '598': 'Uruguay', '599': 'Curaçao',
-                    '670': 'Timor-Leste', '672': 'Antarctica', '673': 'Brunei', '674': 'Nauru',
-                    '675': 'Papua New Guinea', '676': 'Tonga', '677': 'Solomon Islands',
-                    '678': 'Vanuatu', '679': 'Fiji', '680': 'Palau', '681': 'Wallis',
-                    '682': 'Cook Islands', '683': 'Niue', '685': 'Samoa', '686': 'Kiribati',
-                    '687': 'New Caledonia', '688': 'Tuvalu', '689': 'French Polynesia',
-                    '690': 'Tokelau', '691': 'Micronesia', '692': 'Marshall Islands',
-                    '850': 'North Korea', '852': 'Hong Kong', '853': 'Macao', '855': 'Cambodia',
-                    '856': 'Laos', '880': 'Bangladesh', '886': 'Taiwan', '960': 'Maldives',
-                    '961': 'Lebanon', '962': 'Jordan', '963': 'Syria', '964': 'Iraq',
-                    '965': 'Kuwait', '966': 'Saudi Arabia', '967': 'Yemen', '968': 'Oman',
-                    '970': 'Palestine', '971': 'United Arab Emirates', '972': 'Israel',
-                    '973': 'Bahrain', '974': 'Qatar', '975': 'Bhutan', '976': 'Mongolia',
-                    '977': 'Nepal', '992': 'Tajikistan', '993': 'Turkmenistan', '994': 'Azerbaijan',
-                    '995': 'Georgia', '996': 'Kyrgyzstan', '998': 'Uzbekistan',
-                };
-                const countryName = COUNTRY_NAMES_BY_CODE[countryCode];
-                if (countryName) {
-                    const selected = await selectCountryInPhoneDropdown(page, countryName);
-                    if (selected) {
-                        // After country selection, the SMS/WhatsApp radiogroup may appear
-                        await sleep(1000);
-                    }
-                } else {
-                    console.log(`No country name mapping for phone code +${countryCode}, skipping country dropdown selection`);
-                }
-            }
+            // SMS delivery method selection is done OUTSIDE this function,
+            // immediately when the add-phone page first appears (before HeroSMS acquire).
+            // This is critical because the radiogroup disappears after React re-renders.
 
-            await selectSmsDeliveryMethod(page);
-
-            // Build phone number candidates.
-            // If a country was selected in the dropdown, the input field already includes the country prefix,
-            // so we must enter only the local number (without the country code) to avoid duplication.
-            // e.g. for Brazil (+55), activation.phone=5568984180503 → enter 68984180503
+            // Build phone candidates: enter the full international number with + prefix.
+            // OpenAI's phone input auto-detects the country from the number.
             const rawPhone = String(activation.phone || '');
-            let localPhone = rawPhone;
-            if (countryMatch) {
-                const cc = countryMatch[1];
-                if (rawPhone.startsWith(cc)) {
-                    localPhone = rawPhone.slice(cc.length);
-                }
-            }
-            const phoneCandidates = [localPhone, `+${rawPhone}`, rawPhone];
-            console.log(`Phone candidates (raw=${rawPhone}, country code selected=${countryMatch ? countryMatch[1] : 'none'}, local=${localPhone}): ${phoneCandidates.join(', ')}`);
+            const phoneCandidates = [`+${rawPhone}`, rawPhone];
+            console.log(`Phone candidates: ${phoneCandidates.join(', ')}`);
             let codeInputResult = null;
             let deliveryMode = 'unknown';
 
@@ -1860,7 +1941,11 @@ async function performLogin(authUrl) {
         activeAnonymizedProxyUrl = anonymizedProxyUrl;
         console.log(`Browser engine selected: ${browserEngine}`);
 
-        await enableLeanPageRequests(page, browserEngine);
+        if (!['0', 'off', 'false', 'no'].includes(CODEX_LEAN_REQUESTS)) {
+            await enableLeanPageRequests(page, browserEngine);
+        } else {
+            console.log('Lean request blocking disabled (CODEX_LEAN_REQUESTS=off)');
+        }
 
         page.on('pageerror', (err) => {
             console.log(`[PAGEERROR] ${err.message}`);
