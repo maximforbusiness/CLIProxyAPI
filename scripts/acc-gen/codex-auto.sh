@@ -1431,7 +1431,7 @@ for ((idx=START_INDEX; idx<END_INDEX; idx++)); do
             NODE_ENV_ARGS+=("CODEX_PROXY_SCHEME=$PROXY_SCHEME")
         fi
 
-        env "${NODE_ENV_ARGS[@]}" node "$SCRIPT_DIR/codex-login.js" "$LOGIN_URL" "$idx" 2>&1 | tee "$LOGIN_LOG"
+        env "${NODE_ENV_ARGS[@]}" xvfb-run -a node "$SCRIPT_DIR/codex-login.js" "$LOGIN_URL" "$idx" 2>&1 | tee "$LOGIN_LOG"
         LOGIN_EXIT=${PIPESTATUS[0]}
 
         CALLBACK_URL=$(extract_callback_url "$(cat "$LOGIN_LOG" 2>/dev/null)")
@@ -1448,7 +1448,7 @@ for ((idx=START_INDEX; idx<END_INDEX; idx++)); do
                 echo "↻ Sign In failed for account #$idx; retrying once in Sign Up mode..."
                 NODE_ENV_ARGS_SIGNUP=("${NODE_ENV_ARGS[@]}")
                 NODE_ENV_ARGS_SIGNUP+=("CODEX_ENABLE_SIGNUP_FLOW=1")
-                env "${NODE_ENV_ARGS_SIGNUP[@]}" node "$SCRIPT_DIR/codex-login.js" "$LOGIN_URL" "$idx" 2>&1 | tee -a "$LOGIN_LOG"
+                env "${NODE_ENV_ARGS_SIGNUP[@]}" xvfb-run -a node "$SCRIPT_DIR/codex-login.js" "$LOGIN_URL" "$idx" 2>&1 | tee -a "$LOGIN_LOG"
                 LOGIN_EXIT=${PIPESTATUS[0]}
 
                 CALLBACK_URL=$(extract_callback_url "$(cat "$LOGIN_LOG" 2>/dev/null)")

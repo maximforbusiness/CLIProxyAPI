@@ -3,6 +3,15 @@ const proxyChain = require('proxy-chain');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+
+// Stealth plugin for Puppeteer — hides automation indicators
+// that cause OpenAI to serve a degraded add-phone page without SMS selector
+let stealthPlugin = null;
+try {
+    stealthPlugin = require('puppeteer-extra-plugin-stealth')();
+} catch (_) {
+    // stealth plugin not available, will use manual patches
+}
 const { execSync, spawn } = require('child_process');
 
 // Load accounts from accounts.json (or override via CODEX_ACCOUNTS_FILE)
@@ -31,9 +40,9 @@ if (fs.existsSync(ACCOUNTS_FILE)) {
 const ACCOUNT_INDEX = parseInt(process.argv[3]) || 0;
 const ACCOUNT = ACCOUNTS[Math.min(ACCOUNT_INDEX, ACCOUNTS.length - 1)];
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 ];
 const VIEWPORTS = [
     { width: 1366, height: 768 },
@@ -122,7 +131,7 @@ function buildBrowserProfile() {
     return {
         userAgent: pickRandom(USER_AGENTS),
         viewport: pickRandom(VIEWPORTS),
-        acceptLanguage: 'en-US,en;q=0.9'
+        acceptLanguage: 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
     };
 }
 
@@ -1285,23 +1294,7 @@ async function completePhoneVerificationWithHeroSMS(page) {
             console.log(`SMS gate debug dump failed: ${e.message}`);
         }
 
-        // Try selecting SMS once more before final decision
-        await selectSmsDeliveryMethod(page).catch(() => {});
-
-        const smsStateAfter = await page.evaluate(() => {
-            const radioGroup = document.querySelector('div[role="radiogroup"][aria-label="Send code via"], div[role="radiogroup"]');
-            const smsRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="sms"]') : null;
-            const waRadio = radioGroup ? radioGroup.querySelector('input[type="radio"][value="whatsapp"]') : null;
-            const channelInput = document.querySelector('input[name="channel"]');
-            return {
-                hasRadioGroup: !!radioGroup,
-                hasSmsRadio: !!smsRadio,
-                smsChecked: !!(smsRadio && smsRadio.checked),
-                whatsappChecked: !!(waRadio && waRadio.checked),
-                hasChannelInput: !!channelInput,
-                channelValue: channelInput ? String(channelInput.value || '').toLowerCase() : '',
-            };
-        }).catch(() => null);
+        const smsStateAfter = smsState; // Skip post-check here, we'll select SMS after entering the phone number
 
         if (!smsStateAfter) return { ok: false, reason: 'sms_gate_postcheck_failed' };
 
@@ -1371,6 +1364,12 @@ async function completePhoneVerificationWithHeroSMS(page) {
             for (const phoneCandidate of phoneCandidates) {
                 console.log(`Trying phone candidate: ${phoneCandidate}`);
                 await fillInputValue(page, phoneInputResult.handle, phoneCandidate);
+                await sleep(800);
+
+                // IMPORTANT: After entering the phone number, OpenAI auto-detects the country.
+                // For countries like Brazil, it may switch the default delivery method to WhatsApp.
+                // We MUST call selectSmsDeliveryMethod NOW to switch it back to "Text Message".
+                await selectSmsDeliveryMethod(page);
                 await sleep(400);
 
                 // Prefer explicit send/resend controls first.
@@ -1475,7 +1474,17 @@ async function completePhoneVerificationWithHeroSMS(page) {
 }
 
 async function applySteadyBrowserProfile(page, profile, engine) {
+    // Stealth: hide Puppeteer automation indicators so OpenAI serves the full
+    // add-phone page (with SMS/WhatsApp channel selector) instead of a degraded
+    // version that blocks SMS verification.
     if (engine === 'puppeteer') {
+        await page.evaluateOnNewDocument(() => {
+            // The main detection vector is navigator.webdriver being true
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+            // Ensure chrome.runtime exists (headless Chrome lacks it)
+            if (!window.chrome) window.chrome = {};
+            if (!window.chrome.runtime) window.chrome.runtime = {};
+        });
         await page.setUserAgent(profile.userAgent);
         await page.setViewport(profile.viewport);
         await page.setExtraHTTPHeaders({
@@ -1484,10 +1493,15 @@ async function applySteadyBrowserProfile(page, profile, engine) {
         return;
     }
 
+    // Playwright
+    if (typeof page.evaluateOnNewDocument === 'function') {
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+        });
+    }
     if (typeof page.setViewportSize === 'function') {
         await page.setViewportSize(profile.viewport).catch(() => {});
     }
-
     if (typeof page.context === 'function') {
         const context = page.context();
         if (context && typeof context.setExtraHTTPHeaders === 'function') {
@@ -1511,13 +1525,26 @@ async function launchBrowserPage({
     for (const engine of engines) {
         try {
             if (engine === 'puppeteer') {
-                const puppeteer = optionalRequire('puppeteer') || optionalRequire('puppeteer-core');
+                // Try puppeteer-extra with stealth plugin first (hides bot indicators)
+                let useStealth = false;
+                let puppeteerExtra = null;
+                try {
+                    puppeteerExtra = require('puppeteer-extra');
+                    if (stealthPlugin) {
+                        puppeteerExtra.use(stealthPlugin);
+                        useStealth = true;
+                    }
+                } catch (_) {
+                    // puppeteer-extra not available, fallback to regular puppeteer
+                }
+
+                const puppeteer = useStealth ? puppeteerExtra : (optionalRequire('puppeteer') || optionalRequire('puppeteer-core'));
                 if (!puppeteer) {
                     throw new Error('puppeteer module is not installed');
                 }
 
                 const launchOptions = {
-                    headless: 'new',
+                    headless: false,
                     args: launchArgs
                 };
 
@@ -1909,7 +1936,6 @@ async function performLogin(authUrl) {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu',
             '--disable-extensions',
             '--disable-background-networking',
             '--disable-default-apps',
@@ -1919,7 +1945,7 @@ async function performLogin(authUrl) {
             '--ignore-certificate-errors',
             '--mute-audio',
             '--renderer-process-limit=2',
-            '--lang=en-US,en'
+            '--lang=ru-RU,ru,en-US,en'
         ];
         if (proxyServerArg) {
             launchArgs.push(`--proxy-server=${proxyServerArg}`);
