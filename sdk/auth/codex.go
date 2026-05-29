@@ -81,6 +81,7 @@ func (a *CodexAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 	}()
 
 	authSvc := codex.NewCodexAuth(cfg)
+	authSvc.CallbackPort = callbackPort
 
 	authURL, err := authSvc.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
@@ -209,7 +210,7 @@ waitForCallback:
 	}
 
 	fmt.Println("[codex-auth-debug] callback state matched")
-	fmt.Printf("[codex-auth-debug] starting token exchange redirect=%s\n", codex.RedirectURI)
+	fmt.Printf("[codex-auth-debug] starting token exchange redirect=%s\n", fmt.Sprintf("http://localhost:%d/auth/callback", callbackPort))
 
 	authBundle, err := authSvc.ExchangeCodeForTokens(ctx, result.Code, pkceCodes)
 	if err != nil {

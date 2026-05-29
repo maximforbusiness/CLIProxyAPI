@@ -21,17 +21,26 @@ import (
 
 // OAuth configuration constants for OpenAI Codex
 const (
-	AuthURL     = "https://auth.openai.com/oauth/authorize"
-	TokenURL    = "https://auth.openai.com/oauth/token"
-	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
-	RedirectURI = "http://localhost:1455/auth/callback"
+	AuthURL           = "https://auth.openai.com/oauth/authorize"
+	TokenURL          = "https://auth.openai.com/oauth/token"
+	ClientID          = "app_EMoamEEZ73f0CkXaXp7hrann"
+	DefaultCallbackPort = 1455
+	RedirectURI       = "http://localhost:1455/auth/callback"
 )
+
+func defaultRedirectURI(port int) string {
+	if port <= 0 {
+		port = DefaultCallbackPort
+	}
+	return fmt.Sprintf("http://localhost:%d/auth/callback", port)
+}
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
 // It manages the HTTP client and provides methods for generating authorization URLs,
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
-	httpClient *http.Client
+	httpClient   *http.Client
+	CallbackPort int
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
@@ -53,7 +62,8 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
 	return &CodexAuth{
-		httpClient: util.SetProxy(&sdkCfg, &http.Client{Timeout: 90 * time.Second}),
+		httpClient:   util.SetProxy(&sdkCfg, &http.Client{Timeout: 90 * time.Second}),
+		CallbackPort: DefaultCallbackPort,
 	}
 }
 
@@ -65,10 +75,11 @@ func (o *CodexAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string,
 		return "", fmt.Errorf("PKCE codes are required")
 	}
 
+	redirectURI := defaultRedirectURI(o.CallbackPort)
 	params := url.Values{
 		"client_id":                  {ClientID},
 		"response_type":              {"code"},
-		"redirect_uri":               {RedirectURI},
+		"redirect_uri":               {redirectURI},
 		"scope":                      {"openid email profile offline_access"},
 		"state":                      {state},
 		"code_challenge":             {pkceCodes.CodeChallenge},
@@ -86,7 +97,8 @@ func (o *CodexAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string,
 // It performs an HTTP POST request to the OpenAI token endpoint with the provided
 // authorization code and PKCE verifier.
 func (o *CodexAuth) ExchangeCodeForTokens(ctx context.Context, code string, pkceCodes *PKCECodes) (*CodexAuthBundle, error) {
-	return o.ExchangeCodeForTokensWithRedirect(ctx, code, RedirectURI, pkceCodes)
+	redirectURI := defaultRedirectURI(o.CallbackPort)
+	return o.ExchangeCodeForTokensWithRedirect(ctx, code, redirectURI, pkceCodes)
 }
 
 // ExchangeCodeForTokensWithRedirect exchanges an authorization code for tokens using

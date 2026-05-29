@@ -540,6 +540,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method, clientIP string, 
 			&buf,
 			url,
 			method,
+			"",
 			requestHeaders,
 			body,
 			"",
@@ -2042,7 +2043,7 @@ func (w *homeStreamingLogWriter) Close() error {
 
 	var buf bytes.Buffer
 	upstreamTransport := inferUpstreamTransport(w.apiRequest, w.apiResponse, w.apiWebsocketTime, nil, nil)
-	if errWrite := writeRequestInfoWithBody(&buf, w.url, w.method, w.requestHeaders, w.requestBody, "", w.timestamp, "http", upstreamTransport, true); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(&buf, w.url, w.method, "", w.requestHeaders, w.requestBody, "", w.timestamp, "http", upstreamTransport, true); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(&buf, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTime, time.Time{}); errWrite != nil {

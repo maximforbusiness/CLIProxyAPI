@@ -2059,6 +2059,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 	// Initialize Codex auth service
 	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth.CallbackPort = codexCallbackPort
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)

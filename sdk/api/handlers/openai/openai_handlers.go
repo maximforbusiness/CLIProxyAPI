@@ -135,66 +135,6 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 
 }
 
-// ImagesGenerations handles the /v1/images/generations endpoint.
-// It executes image generation through the standard auth manager path and
-// normalizes upstream responses into the OpenAI Images API shape.
-func (h *OpenAIAPIHandler) ImagesGenerations(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: fmt.Sprintf("Invalid request: %v", err),
-				Type:    "invalid_request_error",
-			},
-		})
-		return
-	}
-
-	modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-	if modelName == "" {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "model is required",
-				Type:    "invalid_request_error",
-			},
-		})
-		return
-	}
-
-	if gjson.GetBytes(rawJSON, "stream").Bool() {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "images.generate does not support stream=true",
-				Type:    "invalid_request_error",
-			},
-		})
-		return
-	}
-
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
-		cliCancel(errMsg.Error)
-		return
-	}
-
-	imagesResp, convErr := convertChatCompletionsResponseToImages(resp, rawJSON)
-	if convErr != nil {
-		h.WriteErrorResponse(c, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadGateway,
-			Error:      fmt.Errorf("invalid image generation response: %w", convErr),
-		})
-		cliCancel(convErr)
-		return
-	}
-
-	c.Header("Content-Type", "application/json")
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(imagesResp)
-	cliCancel()
-}
-
 // shouldTreatAsResponsesFormat detects OpenAI Responses-style payloads that are
 // accidentally sent to the Chat Completions endpoint.
 func shouldTreatAsResponsesFormat(rawJSON []byte) bool {
