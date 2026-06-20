@@ -402,8 +402,11 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 		param.ContentBlocksStopped = true
 	}
 
-	// If we haven't sent message_delta yet (no usage info was received), send it now
-	if param.FinishReason != "" && !param.MessageDeltaSent {
+	// If we haven't sent message_delta yet (no usage info was received), send it now.
+	// Also send it when SawToolCall is true but FinishReason is empty — this happens
+	// when upstreams like NVIDIA GLM-5.1 return tool_calls with "finish_reason": null
+	// and never emit a separate finish_reason chunk.
+	if !param.MessageDeltaSent && (param.FinishReason != "" || param.SawToolCall) {
 		messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
 		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
