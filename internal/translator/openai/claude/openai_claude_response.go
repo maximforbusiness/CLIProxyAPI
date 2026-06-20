@@ -8,8 +8,10 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -400,6 +402,35 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			delete(param.ToolCallBlockIndexes, index)
 		}
 		param.ContentBlocksStopped = true
+	}
+
+	// If the stream was completely empty (no chunks at all), emit a minimal
+	// well-formed message so the client doesn't crash with "Stream ended
+	// without finish_reason". This happens when upstream returns 200 OK with
+	// zero data (e.g. NVIDIA GLM-5.1 timing out before generating any tokens).
+	if !param.MessageStarted {
+		// Synthesize message_start
+		msgID := param.MessageID
+		if msgID == "" {
+			msgID = fmt.Sprintf("chatcmpl-empty-%d", time.Now().UnixNano())
+		}
+		model := param.Model
+		if model == "" {
+			model = "unknown"
+		}
+		messageStartJSON := []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
+		messageStartJSON, _ = sjson.SetBytes(messageStartJSON, "message.id", msgID)
+		messageStartJSON, _ = sjson.SetBytes(messageStartJSON, "message.model", model)
+		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_start", messageStartJSON, 2))
+		param.MessageStarted = true
+
+		// Synthesize message_delta with end_turn
+		messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
+		param.MessageDeltaSent = true
+
+		emitMessageStopIfNeeded(param, &results)
+		return results
 	}
 
 	// If we haven't sent message_delta yet (no usage info was received), send it now.
