@@ -389,12 +389,18 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	prov := strings.TrimSpace(auth.Provider)
+	mappedType := prov
+	if prov == "gemini-cli" || prov == "antigravity" {
+		mappedType = "gemini"
+	}
+
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
 		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
+		"type":           mappedType,
+		"provider":       prov,
 		"label":          auth.Label,
 		"status":         auth.Status,
 		"status_message": auth.StatusMessage,
