@@ -391,7 +391,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	prov := strings.TrimSpace(auth.Provider)
 	mappedType := prov
-	if prov == "gemini-cli" || prov == "antigravity" {
+	if prov == "gemini-cli" {
 		mappedType = "gemini"
 	}
 
