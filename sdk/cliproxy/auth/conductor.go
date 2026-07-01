@@ -2309,11 +2309,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						} else if derivedRetryAfter != nil {
 							next = now.Add(*derivedRetryAfter)
 						} else {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-							if cooldown > 0 {
-								next = now.Add(cooldown)
+							// If it's a Gemini / Antigravity quota exhaust without retry-after,
+							// it is typically a daily limit. Set cooldown to max immediately.
+							if result.Provider == "gemini-cli" || result.Provider == "antigravity" {
+								next = now.Add(quotaBackoffMax)
+							} else {
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+								if cooldown > 0 {
+									next = now.Add(cooldown)
+								}
+								backoffLevel = nextLevel
 							}
-							backoffLevel = nextLevel
 						}
 						state.NextRetryAfter = next
 						state.Quota = QuotaState{
