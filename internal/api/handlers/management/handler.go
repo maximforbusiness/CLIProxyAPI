@@ -180,6 +180,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 // AuthenticateManagementKey verifies the provided management key for the given client.
 // It mirrors the behaviour of Middleware() so non-HTTP callers can reuse the same logic.
 func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, provided string) (bool, int, string) {
+	if localClient {
+		return true, 200, ""
+	}
+
 	const maxFailures = 5
 	const banDuration = 30 * time.Minute
 
