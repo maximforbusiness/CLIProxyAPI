@@ -33,6 +33,10 @@ const (
 	openAICompatImagesEditsPath             = "/images/edits"
 	openAICompatDefaultImageEndpoint        = openAICompatImagesGenerationsPath
 	openAICompatMultipartMemory       int64 = 32 << 20
+
+	// Passthrough endpoint paths (embeddings, rerank).
+	openAICompatEmbeddingsPath = "/embeddings"
+	openAICompatRerankPath     = "/rerank"
 )
 
 var nvidiaStableDiffusionEndpoint = "https://ai.api.nvidia.com/v1/genai/stabilityai/stable-diffusion-3-medium"
@@ -89,6 +93,9 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
+	}
+	if endpointPath := openAICompatPassthroughEndpointPath(opts); endpointPath != "" {
+		return e.executePassthrough(ctx, auth, req, opts, endpointPath)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -293,6 +300,95 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
+		err = statusErr{code: httpResp.StatusCode, msg: string(body)}
+		return resp, err
+	}
+
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
+	reporter.EnsurePublished(ctx)
+	resp = cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}
+	return resp, nil
+}
+
+// executePassthrough handles non-streaming passthrough endpoints (embeddings, rerank).
+// It forwards the request payload to the upstream provider as-is, substituting the
+// model name with the base (upstream) model, and returns the response without translation.
+func (e *OpenAICompatExecutor) executePassthrough(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (resp cliproxyexecutor.Response, err error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
+
+	baseURL, apiKey := e.resolveCredentials(auth)
+	if baseURL == "" {
+		err = statusErr{code: http.StatusUnauthorized, msg: "missing provider baseURL"}
+		return resp, err
+	}
+
+	// Replace the model field with the upstream model name.
+	payload := req.Payload
+	if json.Valid(payload) && baseModel != "" {
+		if updated, errSet := sjson.SetBytes(payload, "model", baseModel); errSet == nil {
+			payload = updated
+		}
+	}
+
+	url := strings.TrimSuffix(baseURL, "/") + endpointPath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return resp, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL:       url,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      payload,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("openai compat executor: close passthrough response body error: %v", errClose)
+		}
+	}()
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	body, errRead := io.ReadAll(httpResp.Body)
+	if errRead != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errRead)
+		err = errRead
+		return resp, err
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		helps.LogWithRequestID(ctx).Debugf("passthrough request error, status: %d, body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), body))
 		err = statusErr{code: httpResp.StatusCode, msg: string(body)}
 		return resp, err
 	}
@@ -645,6 +741,20 @@ func openAICompatImageEndpointPath(opts cliproxyexecutor.Options) string {
 		return openAICompatImagesGenerationsPath
 	}
 	return openAICompatDefaultImageEndpoint
+}
+
+// openAICompatPassthroughEndpointPath returns a non-empty path when the inbound
+// request targets an endpoint that should be forwarded to the upstream provider
+// as-is (no translation). Currently this covers /v1/embeddings and /v1/rerank.
+func openAICompatPassthroughEndpointPath(opts cliproxyexecutor.Options) string {
+	path := helps.PayloadRequestPath(opts)
+	if strings.HasSuffix(path, "/embeddings") {
+		return openAICompatEmbeddingsPath
+	}
+	if strings.HasSuffix(path, "/rerank") {
+		return openAICompatRerankPath
+	}
+	return ""
 }
 
 func prepareOpenAICompatImagesPayload(payload []byte, model string, contentType string, stream bool) ([]byte, string, error) {

@@ -389,6 +389,8 @@ func (s *Server) setupRoutes() {
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
 		v1.POST("/images/edits", openaiHandlers.ImagesEdits)
+		v1.POST("/embeddings", openaiHandlers.Embeddings)
+		v1.POST("/rerank", openaiHandlers.Rerank)
 		v1.POST("/videos", openaiHandlers.VideosCreate)
 		v1.POST("/videos/generations", openaiHandlers.XAIVideosGenerations)
 		v1.POST("/videos/edits", openaiHandlers.XAIVideosEdits)
@@ -435,6 +437,8 @@ func (s *Server) setupRoutes() {
 				"POST /v1/chat/completions",
 				"POST /v1/completions",
 				"POST /v1/images/generations",
+				"POST /v1/embeddings",
+				"POST /v1/rerank",
 				"GET /v1/models",
 			},
 		})

@@ -180,6 +180,40 @@ func (h *OpenAIAPIHandler) Completions(c *gin.Context) {
 
 }
 
+// Embeddings handles the /v1/embeddings endpoint.
+// It reads the request body, resolves the model, and forwards the request
+// to the upstream provider as a passthrough (no translation).
+func (h *OpenAIAPIHandler) Embeddings(c *gin.Context) {
+	rawJSON, err := handlers.ReadRequestBody(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	h.handleNonStreamingResponse(c, rawJSON)
+}
+
+// Rerank handles the /v1/rerank endpoint.
+// It reads the request body, resolves the model, and forwards the request
+// to the upstream provider as a passthrough (no translation).
+func (h *OpenAIAPIHandler) Rerank(c *gin.Context) {
+	rawJSON, err := handlers.ReadRequestBody(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	h.handleNonStreamingResponse(c, rawJSON)
+}
+
 // convertCompletionsRequestToChatCompletions converts OpenAI completions API request to chat completions format.
 // This allows the completions endpoint to use the existing chat completions infrastructure.
 //
