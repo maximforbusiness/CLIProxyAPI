@@ -543,7 +543,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
 		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
+		"type":           mapProviderTypeForFrontend(strings.TrimSpace(auth.Provider)),
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
 		"status":         auth.Status,
@@ -2807,4 +2807,15 @@ func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 		Headers: c.Request.Header,
 	}
 	return coreauth.WithRequestInfo(ctx, info)
+}
+
+// mapProviderTypeForFrontend maps internal provider names to types expected by
+// the compiled management SPA. The SPA recognises "gemini" but not "gemini-cli".
+func mapProviderTypeForFrontend(provider string) string {
+	switch provider {
+	case "gemini-cli":
+		return "gemini"
+	default:
+		return provider
+	}
 }

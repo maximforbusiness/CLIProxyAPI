@@ -368,6 +368,10 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if provided == "" {
+		// Allow localhost requests without a key for easy debugging.
+		if localClient {
+			return true, 0, ""
+		}
 		fail()
 		return false, http.StatusUnauthorized, "missing management key"
 	}

@@ -410,6 +410,18 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 		param.MessageDeltaSent = true
 	}
 
+	// Synthesize finish if upstream stream ended without finish_reason (e.g. NVIDIA vLLM bug).
+	if param.FinishReason == "" && !param.MessageDeltaSent {
+		syntheticReason := "end_turn"
+		if param.SawToolCall {
+			syntheticReason = "tool_use"
+		}
+		messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", syntheticReason)
+		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
+		param.MessageDeltaSent = true
+	}
+
 	emitMessageStopIfNeeded(param, &results)
 
 	return results

@@ -4390,6 +4390,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
+								} else if result.Provider == "gemini-cli" || result.Provider == "antigravity" {
+									// Daily quota exhaust without retry-after hint — apply max cooldown immediately.
+									next = now.Add(quotaBackoffMax)
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
