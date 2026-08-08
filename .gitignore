@@ -56,3 +56,8 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+acc-gen/logs/
+acc-gen/.sb-profiles/
+acc-gen/downloaded_files/
+acc-gen/__pycache__/
+*.log
