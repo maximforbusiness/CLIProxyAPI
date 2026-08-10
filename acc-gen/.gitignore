@@ -1,0 +1,12 @@
+acc-gen/codex/codex-auto-state.json
+acc-gen/codex/codex-proxy-cooldown.json
+acc-gen/codex/firstmail-proxy-cooldown.json
+acc-gen/codex/firstmail-retry-10-state.json
+acc-gen/codex/gmail-dotted-retry-10-new-cooldown.json
+acc-gen/codex/gmail-dotted-retry-10-new-state.json
+acc-gen/codex-proxy-cooldown.json
+acc-gen/codex-auto-state.json
+acc-gen/codex/codex-login-debug*.txt
+*.png
+*.log
+
