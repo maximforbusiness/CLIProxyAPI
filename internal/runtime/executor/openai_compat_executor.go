@@ -137,6 +137,19 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
+	// Intercept :batch models — route to OpenRouter Batch API (async, polled synchronously).
+	if shouldUseBatch(baseModel, opts) {
+		batchBody, batchErr := e.executeBatch(ctx, auth, baseURL, apiKey, baseModel, translated)
+		if batchErr != nil {
+			err = batchErr
+			return resp, err
+		}
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(batchBody))
+		var param any
+		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, batchBody, &param)
+		return cliproxyexecutor.Response{Payload: out}, nil
+	}
+
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
@@ -387,6 +400,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+	// Reject stream=true for :batch models — Batch API is asynchronous, no true streaming.
+	if shouldUseBatch(baseModel, opts) {
+		return nil, statusErr{code: http.StatusBadRequest, msg: `{"error":{"message":"streaming is not supported for batch models; use stream=false","type":"invalid_request_error","code":"batch_streaming_unsupported"}}`}
+	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
